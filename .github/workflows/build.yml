@@ -1,0 +1,44 @@
+on: [push, pull_request]
+name: Build (and Release) Workflow
+
+jobs:
+  build:
+    name: Build Job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Install Tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: elf2uf2-rs@2.0.0
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV
+          echo CARGO_TERM_COLOR=always >> $GITHUB_ENV
+      - name: Build
+        run: |
+          cargo xtask build
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{success()}}
+        with:
+          name: Artifacts
+          if-no-files-found: error
+          path: |
+            ./target/pico-term-rs.elf
+            ./target/pico-term-rs.uf2
+      - name: Upload files to Release
+        if: github.event_name == 'push' && startswith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            ./target/pico-term-rs.elf
+            ./target/pico-term-rs.uf2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,23 @@
+[package]
+name = "core0"
+version = "0.1.0"
+authors = [
+    "Jonathan 'theJPster' Pallant <github@thejpster.org.uk>",
+    "The pico-term-rs Developers",
+    "The Neotron Developers"
+]
+edition = "2021"
+description = "Firmware for the RC2014 RP2024 VGA Terminal"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/thejpster/pico-term-rs"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+embedded-hal = { version = "1.0.0" }
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+rp2040-hal = { version="0.10", features=["rt", "critical-section-impl"] }
+rp2040-boot2 = "0.3"
