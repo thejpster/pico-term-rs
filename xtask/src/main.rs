@@ -41,6 +41,7 @@ fn main() -> Result<()> {
         }
         "clippy" => {
             println!("Running clippy...");
+            get_target("thumbv6m-none-eabi")?;
             run_all(&["clippy"])?;
         }
         _ => {
