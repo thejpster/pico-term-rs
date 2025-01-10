@@ -56,6 +56,7 @@ fn main() -> Result<()> {
 
 /// Build the firmware
 fn build() -> Result<()> {
+    get_package("flip-link")?;
     get_target("thumbv6m-none-eabi")?;
     let core1_elf = build_core("core1")?;
     let core0_elf = build_core("core0")?;
@@ -63,6 +64,16 @@ fn build() -> Result<()> {
     let target_uf2 = Path::new("./target/pico-term-rs.uf2");
     merge_firmware(&core0_elf, &core1_elf, target_hex)?;
     make_uf2(target_hex, target_uf2)?;
+    Ok(())
+}
+
+/// Install a package
+fn get_package(package: &str) -> Result<()> {
+    let mut command = std::process::Command::new("cargo");
+    command.arg("install");
+    command.arg("--locked");
+    command.arg(package);
+    run_command(command)?;
     Ok(())
 }
 
