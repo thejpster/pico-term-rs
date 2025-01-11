@@ -1,8 +1,8 @@
 MEMORY {
-    /* Top 1MB on a 2MB chip */
-    FLASH : ORIGIN = 0x10100000, LENGTH = 1024K
-    /* Top two banks, separate from the banks Core 0 is using */
-    RAM   : ORIGIN = 0x20040000, LENGTH = 8K
+    /* Starts 256K in. Must match xtask/src/main.rs and core0/memory.x */
+    FLASH : ORIGIN = 0x10000000 + 256K, LENGTH = 2048K - 256K
+    /* Separate from the banks Core 0 is using. This is Bank 4. We put the stack in Bank 5 */
+    RAM   : ORIGIN = 0x20040000, LENGTH = 4K
 }
 
 EXTERN(ENTRY_POINT);
@@ -65,3 +65,5 @@ SECTIONS {
         *(.ARM.extab.*);
     }
 }
+
+/* End of file */

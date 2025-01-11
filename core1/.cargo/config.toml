@@ -1,4 +1,5 @@
 [target.thumbv6m-none-eabi]
+runner = "probe-rs download --chip RP2040 --protocol swd --speed=20000"
 rustflags = [
   "-C", "link-arg=--nmagic",
   "-C", "link-arg=-Tlink.x",
