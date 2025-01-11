@@ -13,6 +13,7 @@ use panic_probe as _;
 use rp2040_hal as hal;
 
 use hal::{
+    binary_info,
     clocks::{init_clocks_and_plls, Clock},
     pac,
     sio::Sio,
@@ -23,6 +24,16 @@ use hal::{
 #[no_mangle]
 #[used]
 pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+
+#[link_section = ".bi_entries"]
+#[used]
+pub static PICOTOOL_ENTRIES: [binary_info::EntryAddr; 5] = [
+    binary_info::rp_program_name!(c"pico-term-rs"),
+    binary_info::rp_program_description!(c"Rust firmware for the RC2014 RP2040 VGA Terminal"),
+    binary_info::rp_cargo_version!(),
+    binary_info::rp_program_url!(c"https://github.com/thejpster/pico-term-rs"),
+    binary_info::rp_program_build_attribute!(),
+];
 
 unsafe extern "C" {
     /// This variable contains the address of the entry function
