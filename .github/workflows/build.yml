@@ -31,14 +31,16 @@ jobs:
           name: Artifacts
           if-no-files-found: error
           path: |
-            ./target/pico-term-rs.elf
+            ./target/pico-term-rs-core0.elf
+            ./target/pico-term-rs-core1.elf
             ./target/pico-term-rs.uf2
       - name: Upload files to Release
         if: github.event_name == 'push' && startswith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            ./target/pico-term-rs.elf
+            ./target/pico-term-rs-core0.elf
+            ./target/pico-term-rs-core1.elf
             ./target/pico-term-rs.uf2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -68,11 +68,13 @@ fn build(target_dir: &Path) -> Result<()> {
     get_package("flip-link")?;
     get_target("thumbv6m-none-eabi")?;
     let picotool = get_picotool(target_dir)?;
-    let core1_elf = build_core("core1")?;
-    let core0_elf = build_core("core0")?;
+    let target_core0 = target_dir.join("pico-term-rs-core0.elf");
+    let target_core1 = target_dir.join("pico-term-rs-core1.elf");
+    build_core("core0", &target_core0)?;
+    build_core("core1", &target_core1)?;
     let target_bin = target_dir.join("pico-term-rs.bin");
     let target_uf2 = target_dir.join("pico-term-rs.uf2");
-    merge_firmware(&core0_elf, &core1_elf, &target_bin)?;
+    merge_firmware(&target_core0, &target_core1, &target_bin)?;
     make_uf2(&target_bin, &target_uf2, &picotool)?;
     println!(
         "** Complete! You now have {uf2} **",
@@ -107,20 +109,21 @@ fn get_target(target: &str) -> Result<()> {
 }
 
 /// Build the firmware for one core
-fn build_core(core: &str) -> Result<PathBuf> {
+fn build_core(core: &str, output_path: &Path) -> Result<()> {
     println!("Building {core}");
     let mut command = std::process::Command::new("cargo");
     command.arg("build");
     command.arg("--release");
     command.current_dir(core);
     run_command(command)?;
-    let mut output_elf = Path::new(".").to_path_buf();
-    output_elf.push(core);
-    output_elf.push("target");
-    output_elf.push("thumbv6m-none-eabi");
-    output_elf.push("release");
-    output_elf.push(core);
-    Ok(output_elf)
+    let mut generated_elf = Path::new(".").to_path_buf();
+    generated_elf.push(core);
+    generated_elf.push("target");
+    generated_elf.push("thumbv6m-none-eabi");
+    generated_elf.push("release");
+    generated_elf.push(core);
+    std::fs::copy(&generated_elf, output_path)?;
+    Ok(())
 }
 
 /// Combine the two firmwares
