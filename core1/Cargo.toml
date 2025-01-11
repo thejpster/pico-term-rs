@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+cortex-m = "0.7.7"
+embedded-hal = "1.0.0"
+rp2040-hal = { version="0.11", features=["rt", "critical-section-impl"] }
+
+[profile.release]
+debug = 2

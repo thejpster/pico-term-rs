@@ -29,3 +29,5 @@ fn main() {
     // `link.x` is changed.
     println!("cargo:rerun-if-changed=link.x");
 }
+
+// End of file
