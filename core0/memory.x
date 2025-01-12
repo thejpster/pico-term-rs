@@ -5,7 +5,7 @@ MEMORY {
     /* Core 1 at the 256K mark (which must match xtask/src/main.rs and core1/link.x) */
     FLASH : ORIGIN = 0x10000100, LENGTH = 256K - 0x100
     /* Only banks 0 to 3 - banks 4 and 5 belong the other core */
-    RAM   : ORIGIN = 0x20000000, LENGTH = 256K
+    RAM   : ORIGIN = 0x20000000, LENGTH = 128K
     /* Bank 5 */
     CORE1_STACK: ORIGIN = 0x20041000, LENGTH = 4K
 }

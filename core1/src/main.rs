@@ -1,11 +1,15 @@
 //! The firmware that runs on Core 1
+//!
+//! This core assumes that all the GPIO set-up has been done on Core 0 already.
+//!
+//! All this firmware does is render pixels into scan-line buffers, and push
+//! them out using PIO0.
 
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, Ordering};
+mod vga;
 
-use embedded_hal::digital::OutputPin as _;
 use rp2040_hal::{self as hal, pac};
 
 // This is defined in global_asm
@@ -17,11 +21,6 @@ extern "C" {
 #[no_mangle]
 #[link_section = ".entry_point"]
 pub static ENTRY_POINT: unsafe extern "C" fn() -> ! = reset_func;
-
-#[used]
-static COUNTER: AtomicU32 = AtomicU32::new(500);
-
-static SYSTEM_CLOCK_SPEED: u32 = 125_000_000;
 
 // Code to init .bss and .data, and jump to rust_main
 core::arch::global_asm!(
@@ -66,31 +65,30 @@ core::arch::global_asm!(
 #[no_mangle]
 pub unsafe fn rust_main() -> ! {
     // Note: Core 0 is going to be using most of these so we must be careful.
-    let mut periph = pac::Peripherals::take().unwrap();
-    let cm = cortex_m::Peripherals::take().unwrap();
-    let mut sio = hal::sio::Sio::new(periph.SIO);
-    let pins = hal::gpio::Pins::new(
-        periph.IO_BANK0,
-        periph.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut periph.RESETS,
-    );
-    let mut led_pin = pins.gpio25.into_push_pull_output();
+    let periph = pac::Peripherals::take().unwrap();
+    // only keep the FIFO - we don't want to touch anything else
+    let sio = hal::sio::Sio::new(periph.SIO);
+    let fifo = sio.fifo;
+    _ = sio;
+    // some other things we need
+    let pio = periph.PIO0;
+    let dma = periph.DMA;
+    let mut resets = periph.RESETS;
+    // set up our vector table (the boot ROM doesn't do this for us)
+    periph.PPB.vtor().write(|w| w.tbloff().bits(0x2000));
+    // don't touch anything else
+    _ = periph;
 
-    let mut delay = cortex_m::delay::Delay::new(cm.SYST, SYSTEM_CLOCK_SPEED);
+    vga::init(pio, dma, &mut resets);
 
-    loop {
-        led_pin.set_high().unwrap();
-        delay.delay_ms(COUNTER.load(Ordering::Relaxed));
-        if let Some(x) = sio.fifo.read() {
-            COUNTER.store(x, Ordering::Relaxed);
-        }
-        led_pin.set_low().unwrap();
-        delay.delay_ms(COUNTER.load(Ordering::Relaxed));
-        if let Some(x) = sio.fifo.read() {
-            COUNTER.store(x, Ordering::Relaxed);
-        }
+    // We are on Core 1, so these interrupts will run on Core 1
+    unsafe {
+        cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::PIO0_IRQ_1);
+        cortex_m::peripheral::NVIC::unmask(crate::pac::Interrupt::PIO0_IRQ_1);
+        core::arch::asm!("cpsie i");
     }
+
+    vga::render_loop(fifo);
 }
 
 #[panic_handler]
