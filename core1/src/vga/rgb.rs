@@ -48,11 +48,10 @@ impl RGBPair {
     }
 }
 
-/// Represents a 15-bit colour value.
+/// Represents a 16-bit colour value.
 ///
-/// Each channel has five bits, and they are packed in `BGR` format. This is
-/// so the PIO can shift them out right-first, and we have RED0 assigned to
-/// the lowest GPIO pin.
+/// The bits are packed in *565 RGB* format. This is so the PIO can shift them
+/// out right-first, and we have RED0 assigned to the lowest GPIO pin.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct RGBColour(pub u16);
@@ -66,52 +65,13 @@ impl RGBColour {
 
     /// Make an [`RGBColour`] from a 24-bit RGB triplet.
     ///
-    /// Only the top 5 bits of each colour channel are retained, as RGB colour
-    /// is a 15-bit value.
+    /// Only the most significant bits of each colour channel as we convert
+    /// 24-bit colour down to 16-bit colour.
     pub const fn from_24bit(red: u8, green: u8, blue: u8) -> RGBColour {
         let red5: u16 = ((red >> 3) & 0b11111) as u16;
-        let green5: u16 = ((green >> 3) & 0b11111) as u16;
+        let green6: u16 = ((green >> 2) & 0b111111) as u16;
         let blue5: u16 = ((blue >> 3) & 0b11111) as u16;
-        RGBColour((blue5 << 10) | (green5 << 5) | red5)
-    }
-
-    /// Make an [`RGBColour`] from a 12-bit RGB triplet.
-    ///
-    /// Only the bottom 4 bits of each colour channel are retained.
-    pub const fn from_12bit(red: u8, green: u8, blue: u8) -> RGBColour {
-        let red5: u16 = ((red << 1) & 0b11111) as u16;
-        let green5: u16 = ((green << 1) & 0b11111) as u16;
-        let blue5: u16 = ((blue << 1) & 0b11111) as u16;
-        RGBColour((blue5 << 10) | (green5 << 5) | red5)
-    }
-
-    /// Make an [`RGBColour`] from a 15-bit RGB triplet.
-    ///
-    /// Only the bottom 5 bits of each colour channel are retained, as RGB colour
-    /// is a 15-bit value.
-    pub const fn from_15bit(red: u8, green: u8, blue: u8) -> RGBColour {
-        let red5: u16 = (red & 0b11111) as u16;
-        let green5: u16 = (green & 0b11111) as u16;
-        let blue5: u16 = (blue & 0b11111) as u16;
-        RGBColour((blue5 << 10) | (green5 << 5) | red5)
-    }
-
-    /// Get the red component as an 8-bit value
-    pub const fn red8(self) -> u8 {
-        let red5 = self.0 & 0b11111;
-        (red5 << 5) as u8
-    }
-
-    /// Get the green component as an 8-bit value
-    pub const fn green8(self) -> u8 {
-        let green5 = (self.0 >> 5) & 0b11111;
-        (green5 << 5) as u8
-    }
-
-    /// Get the blue component as an 8-bit value
-    pub const fn blue8(self) -> u8 {
-        let blue5 = (self.0 >> 10) & 0x0F;
-        (blue5 << 5) as u8
+        RGBColour((blue5 << 11) | (green6 << 5) | red5)
     }
 }
 

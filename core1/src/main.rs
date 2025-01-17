@@ -10,51 +10,12 @@
 
 mod vga;
 
+use cortex_m_rt::exception;
 use rp2040_hal::{self as hal, pac};
 
-// This is defined in global_asm
 extern "C" {
-    fn reset_func() -> !;
+    static FLASH_ORIGIN: u32;
 }
-
-/// This variable is what Core 0 uses to boot Core 1
-#[no_mangle]
-#[link_section = ".entry_point"]
-pub static ENTRY_POINT: unsafe extern "C" fn() -> ! = reset_func;
-
-// Code to init .bss and .data, and jump to rust_main
-core::arch::global_asm!(
-    ".cfi_sections .debug_frame",
-    ".section .text, \"ax\"",
-    ".global .reset_func",
-    ".type reset_func,%function",
-    ".thumb_func",
-    ".cfi_startproc",
-    "reset_func:",
-    "   ldr r0, =__sbss",
-    "   ldr r1, =__ebss",
-    "   movs r2, #0",
-    "   0:",
-    "      cmp r1, r0",
-    "      beq 1f",
-    "      stm r0!, {{r2}}",
-    "      b 0b",
-    "   1:",
-    "   ldr r0, =__sdata",
-    "   ldr r1, =__edata",
-    "   ldr r2, =__sidata",
-    "   0:",
-    "      cmp r1, r0",
-    "      beq 1f",
-    "      ldm r2!, {{r3}}",
-    "      stm r0!, {{r3}}",
-    "      b 0b",
-    "   1:",
-    "   bl rust_main",
-    "   udf #0",
-    ".cfi_endproc",
-    ".size reset_func, . - reset_func",
-);
 
 /// The entry point to this firmare
 ///
@@ -62,8 +23,8 @@ core::arch::global_asm!(
 ///
 /// Do not call this function manually - only let the Boot ROM call this
 /// function.
-#[no_mangle]
-pub unsafe fn rust_main() -> ! {
+#[cortex_m_rt::entry]
+fn main() -> ! {
     // Note: Core 0 is going to be using most of these so we must be careful.
     let periph = pac::Peripherals::take().unwrap();
     // only keep the FIFO - we don't want to touch anything else
@@ -73,27 +34,73 @@ pub unsafe fn rust_main() -> ! {
     // some other things we need
     let pio = periph.PIO0;
     let dma = periph.DMA;
+    let ppb = periph.PPB;
     let mut resets = periph.RESETS;
-    // set up our vector table (the boot ROM doesn't do this for us)
-    periph.PPB.vtor().write(|w| w.tbloff().bits(0x2000));
     // don't touch anything else
     _ = periph;
 
+    // set up our vector table (we have our own, different to Core 0)
+    ppb.vtor().write(|w| {
+        unsafe {
+            w.bits(core::ptr::addr_of!(FLASH_ORIGIN) as u32);
+        }
+        w
+    });
+
     vga::init(pio, dma, &mut resets);
+    // alt_init(pio, dma, &mut resets);
 
     // We are on Core 1, so these interrupts will run on Core 1
     unsafe {
         cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::PIO0_IRQ_1);
         cortex_m::peripheral::NVIC::unmask(crate::pac::Interrupt::PIO0_IRQ_1);
-        core::arch::asm!("cpsie i");
+        cortex_m::interrupt::enable();
     }
 
     vga::render_loop(fifo);
 }
 
-#[panic_handler]
-fn panic_handler(_info: &core::panic::PanicInfo) -> ! {
+#[exception(trampoline = true)]
+unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    fifo_write(0xDDDD_0003);
+    fifo_write(frame.r0());
+    fifo_write(frame.r1());
+    fifo_write(frame.r2());
+    fifo_write(frame.r3());
+    fifo_write(frame.r12());
+    fifo_write(frame.lr());
+    fifo_write(frame.pc());
     loop {}
+}
+
+#[panic_handler]
+fn panic_handler(info: &core::panic::PanicInfo) -> ! {
+    if let Some(location) = info.location() {
+        fifo_write(0xDDDD_0001);
+        fifo_write(location.line());
+    } else {
+        fifo_write(0xDDDD_0002);
+    }
+    loop {}
+}
+
+fn fifo_ready() -> bool {
+    let sio = unsafe { &(*pac::SIO::ptr()) };
+    sio.fifo_st().read().rdy().bit_is_set()
+}
+
+pub fn fifo_write(value: u32) {
+    while !fifo_ready() {
+        core::hint::spin_loop();
+    }
+
+    let sio = unsafe { &(*pac::SIO::ptr()) };
+    sio.fifo_wr().write(|w| unsafe { w.bits(value) });
+    // Fire off an event to the other core.
+    // This is required as the other core may be `wfe` (waiting for event)
+    unsafe {
+        core::arch::asm!("sev");
+    }
 }
 
 // End of file

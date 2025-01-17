@@ -50,7 +50,7 @@ use core::{
 };
 use neotron_common_bios::video::{Attr, GlyphAttr, TextBackgroundColour, TextForegroundColour};
 
-use core::sync::atomic::{AtomicU8, AtomicUsize};
+use core::sync::atomic::AtomicUsize;
 pub use rgb::{RGBColour, RGBPair};
 
 // -----------------------------------------------------------------------------
@@ -60,56 +60,6 @@ pub use rgb::{RGBColour, RGBPair};
 /// A font
 pub struct Font<'a> {
     data: &'a [u8],
-}
-
-/// Holds a video mode and its framebuffer pointer as a pair.
-#[derive(Copy, Clone)]
-pub struct ModeInfo {
-    pub mode: neotron_common_bios::video::Mode,
-    pub ptr: *mut u32,
-}
-
-/// Holds a video mode and a pointer, but as an atomic value suitable for use in
-/// a `static`.
-pub struct VideoMode {
-    raw_mode: AtomicU8,
-    raw_ptr: AtomicUsize,
-}
-
-unsafe impl Sync for VideoMode {}
-
-impl VideoMode {
-    /// Construct a new [`NewModeWrapper`] with the given mode.
-    const fn new() -> VideoMode {
-        let mode = neotron_common_bios::video::Mode::new(
-            neotron_common_bios::video::Timing::T640x480,
-            neotron_common_bios::video::Format::Text8x16,
-        );
-        // let's just display the start of SRAM
-        let ptr = 0x2000_0000;
-        VideoMode {
-            raw_mode: AtomicU8::new(mode.as_u8()),
-            raw_ptr: AtomicUsize::new(ptr),
-        }
-    }
-
-    /// Set a new video mode.
-    pub fn set_mode(&self, modeinfo: ModeInfo) {
-        self.raw_mode
-            .store(modeinfo.mode.as_u8(), Ordering::Relaxed);
-        self.raw_ptr.store(modeinfo.ptr as usize, Ordering::Relaxed);
-    }
-
-    /// Get the current video mode.
-    pub fn get_mode(&self) -> ModeInfo {
-        let raw_mode = self.raw_mode.load(Ordering::Relaxed);
-        let raw_ptr = self.raw_ptr.load(Ordering::Relaxed);
-        let modeinfo = ModeInfo {
-            mode: unsafe { neotron_common_bios::video::Mode::from_u8(raw_mode) },
-            ptr: raw_ptr as *mut u32,
-        };
-        modeinfo
-    }
 }
 
 /// Describes the polarity of a sync pulse.
@@ -149,6 +99,8 @@ struct RenderEngine {
     current_video_mode: neotron_common_bios::video::Mode,
     /// The current framebuffer pointer
     current_video_ptr: *const u32,
+    /// The current video mode
+    new_video_mode: Option<(neotron_common_bios::video::Mode, *const u32)>,
     /// How many rows of text are we showing right now
     num_text_rows: usize,
     /// How many columns of text are we showing right now
@@ -161,8 +113,12 @@ impl RenderEngine {
         RenderEngine {
             frame_count: 0,
             // Should match the default value of TIMING_BUFFER and VIDEO_MODE
-            current_video_mode: unsafe { neotron_common_bios::video::Mode::from_u8(0) },
-            current_video_ptr: core::ptr::null_mut(),
+            current_video_mode: unsafe { neotron_common_bios::video::Mode::from_u8(1) },
+            // this is basically random, but also we're trying to avoid the
+            // bottom of our stack, because the MPU won't let us read the bottom
+            // of the stack as a means of stack overflow protection.
+            current_video_ptr: 0x2003b000 as *const u32,
+            new_video_mode: None,
             // Should match the mode above
             num_text_cols: 80,
             num_text_rows: 30,
@@ -170,19 +126,13 @@ impl RenderEngine {
     }
 
     /// Do the start-of-frame setup
+    #[link_section = ".data"]
     fn frame_start(&mut self) {
         self.frame_count += 1;
-
         // Update video mode only on first line of video
-        loop {
-            let modeinfo = VIDEO_MODE.get_mode();
-            self.current_video_ptr = modeinfo.ptr;
-            self.current_video_mode = modeinfo.mode;
-            let modeinfo2 = VIDEO_MODE.get_mode();
-            // make sure we get these two as a pair and they can't update one without the other
-            if modeinfo.mode == modeinfo2.mode {
-                break;
-            }
+        if let Some((mode, ptr)) = self.new_video_mode {
+            self.current_video_mode = mode;
+            self.current_video_ptr = ptr;
         }
         // Tell the ISR to now generate our newly chosen timing
         CURRENT_TIMING_MODE.store(self.current_video_mode.timing() as usize, Ordering::Relaxed);
@@ -917,6 +867,7 @@ impl ScanlineTimingBuffer {
 
 /// Holds the different kinds of scan-line timing buffers we need for various
 /// portions of the screen.
+#[repr(C)]
 struct TimingBuffer {
     /// We use this when there are visible pixels on screen
     visible_line: ScanlineTimingBuffer,
@@ -1155,20 +1106,6 @@ impl Chunky4ColourLookup {
 /// make the pixel PIO take twice as long per pixel.
 pub const MAX_NUM_PIXELS_PER_LINE: usize = 640;
 
-/// Maximum number of lines on screen.
-pub const MAX_NUM_LINES: usize = 480;
-
-/// The highest number of columns in any text mode.
-pub const MAX_TEXT_COLS: usize = MAX_NUM_PIXELS_PER_LINE / 8;
-
-/// The highest number of rows in any text mode.
-pub const MAX_TEXT_ROWS: usize = MAX_NUM_LINES / 8;
-
-/// Stores our current video mode.
-///
-/// Copied at the start of every frame by the code on Core 1.
-pub static VIDEO_MODE: VideoMode = VideoMode::new();
-
 /// Holds 16 palette entries, paired with every other of 16 palette entries.
 ///
 /// Allows a fast lookup of an RGB pixel pair given two 4-bpp pixels packed into a byte.
@@ -1181,517 +1118,517 @@ static CHUNKY4_COLOUR_LOOKUP: Chunky4ColourLookup = Chunky4ColourLookup::blank()
 /// should match [`neotron_common_bios::video::TextForegroundColour`].
 static VIDEO_PALETTE: [AtomicU16; 256] = [
     // Index 000: 0x000 (Black)
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x0, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 001: 0x00a (Blue)
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x0, 0xa).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0xaa).0),
     // Index 002: 0x0a0 (Green)
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xaa, 0x00).0),
     // Index 003: 0x0aa (Cyan)
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0xa).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xaa, 0xaa).0),
     // Index 004: 0xa00 (Red)
-    AtomicU16::new(RGBColour::from_12bit(0xa, 0x0, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xaa, 0x00, 0x00).0),
     // Index 005: 0xa0a (Magenta)
-    AtomicU16::new(RGBColour::from_12bit(0xa, 0x0, 0xa).0),
+    AtomicU16::new(RGBColour::from_24bit(0xaa, 0x00, 0xaa).0),
     // Index 006: 0xaa0 (Brown)
-    AtomicU16::new(RGBColour::from_12bit(0xa, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xaa, 0x55, 0x00).0),
     // Index 007: 0xaaa (Light Gray)
-    AtomicU16::new(RGBColour::from_12bit(0xa, 0xa, 0xa).0),
+    AtomicU16::new(RGBColour::from_24bit(0xaa, 0xaa, 0xaa).0),
     // Index 008: 0x666 (Dark Gray)
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x6, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0x55, 0x55).0),
     // Index 009: 0x00f (Light Blue)
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x0, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0x55, 0xff).0),
     // Index 010: 0x0f0 (Light Green)
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xf, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0xff, 0x55).0),
     // Index 011: 0x0ff (Light Cyan)
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xf, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0xff, 0xff).0),
     // Index 012: 0xf00 (Light Red)
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x0, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x55, 0x55).0),
     // Index 013: 0xf0f (Pink)
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x0, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x55, 0xff).0),
     // Index 014: 0xff0 (Yellow)
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xf, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xff, 0x55).0),
     // Index 015: 0xfff (White)
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xf, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xff, 0xff).0),
     // Index 016: 0x003
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x0, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 017: 0x006
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x0, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x14, 0x14, 0x14).0),
     // Index 018: 0x00c
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x0, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x20, 0x20).0),
     // Index 019: 0x020
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x2, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x2c, 0x2c).0),
     // Index 020: 0x023
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x2, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x38, 0x38).0),
     // Index 021: 0x026
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x2, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x45, 0x45, 0x45).0),
     // Index 022: 0x028
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x2, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x51, 0x51).0),
     // Index 023: 0x02c
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x2, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x61, 0x61, 0x61).0),
     // Index 024: 0x02f
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x2, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x71, 0x71).0),
     // Index 025: 0x040
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x4, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x82, 0x82, 0x82).0),
     // Index 026: 0x043
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x4, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x92, 0x92, 0x92).0),
     // Index 027: 0x046
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x4, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xa2, 0xa2, 0xa2).0),
     // Index 028: 0x048
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x4, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xb6, 0xb6).0),
     // Index 029: 0x04c
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x4, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xcb, 0xcb, 0xcb).0),
     // Index 030: 0x04f
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x4, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xe3, 0xe3, 0xe3).0),
     // Index 031: 0x083
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x8, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xff, 0xff).0),
     // Index 032: 0x086
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x8, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0xff).0),
     // Index 033: 0x08c
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x8, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x00, 0xff).0),
     // Index 034: 0x08f
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0x8, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0x00, 0xff).0),
     // Index 035: 0x0a0
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xbe, 0x00, 0xff).0),
     // Index 036: 0x0a3
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x00, 0xff).0),
     // Index 037: 0x0a6
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x00, 0xbe).0),
     // Index 038: 0x0a8
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x00, 0x7d).0),
     // Index 039: 0x0ac
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x00, 0x41).0),
     // Index 040: 0x0af
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xa, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x00, 0x00).0),
     // Index 041: 0x0e0
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xe, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x41, 0x00).0),
     // Index 042: 0x0e3
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xe, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x7d, 0x00).0),
     // Index 043: 0x0e6
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xe, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xbe, 0x00).0),
     // Index 044: 0x0e8
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xe, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xff, 0x00).0),
     // Index 045: 0x0ec
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xe, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xbe, 0xff, 0x00).0),
     // Index 046: 0x0ef
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xe, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xff, 0x00).0),
     // Index 047: 0x0f3
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xf, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0xff, 0x00).0),
     // Index 048: 0x0f6
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xf, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xff, 0x00).0),
     // Index 049: 0x0f8
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xf, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xff, 0x41).0),
     // Index 050: 0x0fc
-    AtomicU16::new(RGBColour::from_12bit(0x0, 0xf, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xff, 0x7d).0),
     // Index 051: 0x300
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x0, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xff, 0xbe).0),
     // Index 052: 0x303
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x0, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xff, 0xff).0),
     // Index 053: 0x306
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x0, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0xbe, 0xff).0),
     // Index 054: 0x308
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x0, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x7d, 0xff).0),
     // Index 055: 0x30c
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x0, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x41, 0xff).0),
     // Index 056: 0x30f
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x0, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0x7d, 0xff).0),
     // Index 057: 0x320
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x2, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x9e, 0x7d, 0xff).0),
     // Index 058: 0x323
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x2, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xbe, 0x7d, 0xff).0),
     // Index 059: 0x326
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x2, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xdf, 0x7d, 0xff).0),
     // Index 060: 0x328
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x2, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x7d, 0xff).0),
     // Index 061: 0x32c
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x2, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x7d, 0xdf).0),
     // Index 062: 0x32f
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x2, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x7d, 0xbe).0),
     // Index 063: 0x340
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x4, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x7d, 0x9e).0),
     // Index 064: 0x343
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x4, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x7d, 0x7d).0),
     // Index 065: 0x346
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x4, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0x9e, 0x7d).0),
     // Index 066: 0x348
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x4, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xbe, 0x7d).0),
     // Index 067: 0x34c
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x4, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xdf, 0x7d).0),
     // Index 068: 0x34f
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x4, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xff, 0x7d).0),
     // Index 069: 0x380
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x8, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xdf, 0xff, 0x7d).0),
     // Index 070: 0x383
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x8, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xbe, 0xff, 0x7d).0),
     // Index 071: 0x386
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x8, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x9e, 0xff, 0x7d).0),
     // Index 072: 0x388
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x8, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xff, 0x7d).0),
     // Index 073: 0x38c
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x8, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xff, 0x9e).0),
     // Index 074: 0x38f
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x8, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xff, 0xbe).0),
     // Index 075: 0x3a0
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xff, 0xdf).0),
     // Index 076: 0x3a3
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xa, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xff, 0xff).0),
     // Index 077: 0x3a6
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xa, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xdf, 0xff).0),
     // Index 078: 0x3a8
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xa, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0xbe, 0xff).0),
     // Index 079: 0x3ac
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xa, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x7d, 0x9e, 0xff).0),
     // Index 080: 0x3af
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xa, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xb6, 0xff).0),
     // Index 081: 0x3e0
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xe, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xc7, 0xb6, 0xff).0),
     // Index 082: 0x3e3
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xe, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xdb, 0xb6, 0xff).0),
     // Index 083: 0x3e6
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xe, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xeb, 0xb6, 0xff).0),
     // Index 084: 0x3e8
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xe, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xb6, 0xff).0),
     // Index 085: 0x3ec
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xe, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xb6, 0xeb).0),
     // Index 086: 0x3ef
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xe, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xb6, 0xdb).0),
     // Index 087: 0x3f0
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xf, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xb6, 0xc7).0),
     // Index 088: 0x3f3
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xf, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xb6, 0xb6).0),
     // Index 089: 0x3f6
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xf, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xc7, 0xb6).0),
     // Index 090: 0x3f8
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xf, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xdb, 0xb6).0),
     // Index 091: 0x3fc
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xf, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xeb, 0xb6).0),
     // Index 092: 0x3ff
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0xf, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xff, 0xff, 0xb6).0),
     // Index 093: 0x600
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x0, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xeb, 0xff, 0xb6).0),
     // Index 094: 0x603
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x0, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xdb, 0xff, 0xb6).0),
     // Index 095: 0x606
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x0, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xc7, 0xff, 0xb6).0),
     // Index 096: 0x608
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x0, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xff, 0xb6).0),
     // Index 097: 0x60c
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x0, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xff, 0xc7).0),
     // Index 098: 0x60f
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x0, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xff, 0xdb).0),
     // Index 099: 0x620
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x2, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xff, 0xeb).0),
     // Index 100: 0x623
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x2, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xff, 0xff).0),
     // Index 101: 0x626
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x2, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xeb, 0xff).0),
     // Index 102: 0x628
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x2, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xdb, 0xff).0),
     // Index 103: 0x62c
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x2, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0xb6, 0xc7, 0xff).0),
     // Index 104: 0x62f
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x2, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x71).0),
     // Index 105: 0x640
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x4, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x1c, 0x00, 0x71).0),
     // Index 106: 0x643
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x4, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x00, 0x71).0),
     // Index 107: 0x646
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x4, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0x00, 0x71).0),
     // Index 108: 0x648
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x4, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x00, 0x71).0),
     // Index 109: 0x64c
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x4, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x00, 0x55).0),
     // Index 110: 0x64f
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x4, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x00, 0x38).0),
     // Index 111: 0x680
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x8, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x00, 0x1c).0),
     // Index 112: 0x683
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x8, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x00, 0x00).0),
     // Index 113: 0x686
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x8, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x1c, 0x00).0),
     // Index 114: 0x688
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x8, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x38, 0x00).0),
     // Index 115: 0x68c
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x8, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x55, 0x00).0),
     // Index 116: 0x68f
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0x8, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x71, 0x00).0),
     // Index 117: 0x6a0
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0x71, 0x00).0),
     // Index 118: 0x6a3
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xa, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x71, 0x00).0),
     // Index 119: 0x6a6
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xa, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x1c, 0x71, 0x00).0),
     // Index 120: 0x6a8
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xa, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x71, 0x00).0),
     // Index 121: 0x6ac
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xa, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x71, 0x1c).0),
     // Index 122: 0x6af
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xa, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x71, 0x38).0),
     // Index 123: 0x6e0
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xe, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x71, 0x55).0),
     // Index 124: 0x6e3
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xe, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x71, 0x71).0),
     // Index 125: 0x6e6
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xe, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x55, 0x71).0),
     // Index 126: 0x6e8
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xe, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x38, 0x71).0),
     // Index 127: 0x6ec
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xe, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x1c, 0x71).0),
     // Index 128: 0x6ef
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xe, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x38, 0x71).0),
     // Index 129: 0x6f0
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xf, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x45, 0x38, 0x71).0),
     // Index 130: 0x6f3
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xf, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0x38, 0x71).0),
     // Index 131: 0x6f6
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xf, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x61, 0x38, 0x71).0),
     // Index 132: 0x6f8
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xf, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x38, 0x71).0),
     // Index 133: 0x6fc
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xf, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x38, 0x61).0),
     // Index 134: 0x6ff
-    AtomicU16::new(RGBColour::from_12bit(0x6, 0xf, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x38, 0x55).0),
     // Index 135: 0x803
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x0, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x38, 0x45).0),
     // Index 136: 0x806
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x0, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x38, 0x38).0),
     // Index 137: 0x80c
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x0, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x45, 0x38).0),
     // Index 138: 0x80f
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x0, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x55, 0x38).0),
     // Index 139: 0x820
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x2, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x61, 0x38).0),
     // Index 140: 0x823
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x2, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x71, 0x38).0),
     // Index 141: 0x826
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x2, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x61, 0x71, 0x38).0),
     // Index 142: 0x828
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x2, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x55, 0x71, 0x38).0),
     // Index 143: 0x82c
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x2, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x45, 0x71, 0x38).0),
     // Index 144: 0x82f
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x2, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x71, 0x38).0),
     // Index 145: 0x840
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x4, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x71, 0x45).0),
     // Index 146: 0x843
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x4, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x71, 0x55).0),
     // Index 147: 0x846
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x4, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x71, 0x61).0),
     // Index 148: 0x848
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x4, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x71, 0x71).0),
     // Index 149: 0x84c
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x4, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x61, 0x71).0),
     // Index 150: 0x84f
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x4, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x55, 0x71).0),
     // Index 151: 0x883
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x8, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x45, 0x71).0),
     // Index 152: 0x886
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x8, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x51, 0x71).0),
     // Index 153: 0x88c
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x8, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x59, 0x51, 0x71).0),
     // Index 154: 0x88f
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0x8, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x61, 0x51, 0x71).0),
     // Index 155: 0x8a0
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x69, 0x51, 0x71).0),
     // Index 156: 0x8a3
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xa, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x51, 0x71).0),
     // Index 157: 0x8a6
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xa, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x51, 0x69).0),
     // Index 158: 0x8a8
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xa, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x51, 0x61).0),
     // Index 159: 0x8ac
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xa, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x51, 0x59).0),
     // Index 160: 0x8af
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xa, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x51, 0x51).0),
     // Index 161: 0x8e0
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xe, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x59, 0x51).0),
     // Index 162: 0x8e3
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xe, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x61, 0x51).0),
     // Index 163: 0x8e6
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xe, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x69, 0x51).0),
     // Index 164: 0x8e8
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xe, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x71, 0x71, 0x51).0),
     // Index 165: 0x8ec
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xe, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x69, 0x71, 0x51).0),
     // Index 166: 0x8ef
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xe, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x61, 0x71, 0x51).0),
     // Index 167: 0x8f0
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xf, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x59, 0x71, 0x51).0),
     // Index 168: 0x8f3
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xf, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x71, 0x51).0),
     // Index 169: 0x8f6
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xf, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x71, 0x59).0),
     // Index 170: 0x8f8
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xf, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x71, 0x61).0),
     // Index 171: 0x8fc
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xf, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x71, 0x69).0),
     // Index 172: 0x8ff
-    AtomicU16::new(RGBColour::from_12bit(0x8, 0xf, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x71, 0x71).0),
     // Index 173: 0xc00
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x0, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x69, 0x71).0),
     // Index 174: 0xc03
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x0, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x61, 0x71).0),
     // Index 175: 0xc06
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x0, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x51, 0x59, 0x71).0),
     // Index 176: 0xc08
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x0, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x41).0),
     // Index 177: 0xc0c
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x0, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x10, 0x00, 0x41).0),
     // Index 178: 0xc0f
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x0, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x00, 0x41).0),
     // Index 179: 0xc20
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x2, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x30, 0x00, 0x41).0),
     // Index 180: 0xc23
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x2, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x00, 0x41).0),
     // Index 181: 0xc26
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x2, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x00, 0x30).0),
     // Index 182: 0xc28
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x2, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x00, 0x20).0),
     // Index 183: 0xc2c
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x2, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x00, 0x10).0),
     // Index 184: 0xc2f
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x2, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x00, 0x00).0),
     // Index 185: 0xc40
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x4, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x10, 0x00).0),
     // Index 186: 0xc43
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x4, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x20, 0x00).0),
     // Index 187: 0xc46
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x4, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x30, 0x00).0),
     // Index 188: 0xc48
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x4, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x41, 0x00).0),
     // Index 189: 0xc4c
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x4, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x30, 0x41, 0x00).0),
     // Index 190: 0xc4f
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x4, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x41, 0x00).0),
     // Index 191: 0xc80
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x8, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x10, 0x41, 0x00).0),
     // Index 192: 0xc83
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x8, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x41, 0x00).0),
     // Index 193: 0xc86
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x8, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x41, 0x10).0),
     // Index 194: 0xc88
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x8, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x41, 0x20).0),
     // Index 195: 0xc8c
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x8, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x41, 0x30).0),
     // Index 196: 0xc8f
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0x8, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x41, 0x41).0),
     // Index 197: 0xca0
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x30, 0x41).0),
     // Index 198: 0xca3
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xa, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x20, 0x41).0),
     // Index 199: 0xca6
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xa, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x10, 0x41).0),
     // Index 200: 0xca8
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xa, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x20, 0x41).0),
     // Index 201: 0xcac
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xa, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x28, 0x20, 0x41).0),
     // Index 202: 0xcaf
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xa, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x30, 0x20, 0x41).0),
     // Index 203: 0xce0
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xe, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x20, 0x41).0),
     // Index 204: 0xce3
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xe, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x20, 0x41).0),
     // Index 205: 0xce6
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xe, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x20, 0x38).0),
     // Index 206: 0xce8
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xe, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x20, 0x30).0),
     // Index 207: 0xcec
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xe, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x20, 0x28).0),
     // Index 208: 0xcef
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xe, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x20, 0x20).0),
     // Index 209: 0xcf0
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xf, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x28, 0x20).0),
     // Index 210: 0xcf3
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xf, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x30, 0x20).0),
     // Index 211: 0xcf6
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xf, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x38, 0x20).0),
     // Index 212: 0xcf8
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xf, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x41, 0x20).0),
     // Index 213: 0xcfc
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xf, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x38, 0x41, 0x20).0),
     // Index 214: 0xcff
-    AtomicU16::new(RGBColour::from_12bit(0xc, 0xf, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x30, 0x41, 0x20).0),
     // Index 215: 0xf03
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x0, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x28, 0x41, 0x20).0),
     // Index 216: 0xf06
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x0, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x41, 0x20).0),
     // Index 217: 0xf08
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x0, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x41, 0x28).0),
     // Index 218: 0xf0c
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x0, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x41, 0x30).0),
     // Index 219: 0xf20
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x2, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x41, 0x38).0),
     // Index 220: 0xf23
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x2, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x41, 0x41).0),
     // Index 221: 0xf26
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x2, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x38, 0x41).0),
     // Index 222: 0xf28
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x2, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x30, 0x41).0),
     // Index 223: 0xf2c
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x2, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x20, 0x28, 0x41).0),
     // Index 224: 0xf2f
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x2, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x2c, 0x41).0),
     // Index 225: 0xf40
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x4, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x30, 0x2c, 0x41).0),
     // Index 226: 0xf43
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x4, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x34, 0x2c, 0x41).0),
     // Index 227: 0xf46
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x4, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x3c, 0x2c, 0x41).0),
     // Index 228: 0xf48
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x4, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x2c, 0x41).0),
     // Index 229: 0xf4c
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x4, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x2c, 0x3c).0),
     // Index 230: 0xf4f
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x4, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x2c, 0x34).0),
     // Index 231: 0xf80
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x8, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x2c, 0x30).0),
     // Index 232: 0xf83
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x8, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x2c, 0x2c).0),
     // Index 233: 0xf86
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x8, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x30, 0x2c).0),
     // Index 234: 0xf88
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x8, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x34, 0x2c).0),
     // Index 235: 0xf8c
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x8, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x3c, 0x2c).0),
     // Index 236: 0xf8f
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0x8, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x41, 0x41, 0x2c).0),
     // Index 237: 0xfa0
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xa, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x3c, 0x41, 0x2c).0),
     // Index 238: 0xfa3
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xa, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x34, 0x41, 0x2c).0),
     // Index 239: 0xfa6
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xa, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x30, 0x41, 0x2c).0),
     // Index 240: 0xfa8
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xa, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x41, 0x2c).0),
     // Index 241: 0xfac
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xa, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x41, 0x30).0),
     // Index 242: 0xfaf
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xa, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x41, 0x34).0),
     // Index 243: 0xfe0
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xe, 0x0).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x41, 0x3c).0),
     // Index 244: 0xfe3
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xe, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x41, 0x41).0),
     // Index 245: 0xfe6
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xe, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x3c, 0x41).0),
     // Index 246: 0xfe8
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xe, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x34, 0x41).0),
     // Index 247: 0xfec
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xe, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x2c, 0x30, 0x41).0),
     // Index 248: 0xfef
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xe, 0xf).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 249: 0xff3
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xf, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 250: 0xff6
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xf, 0x6).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 251: 0xff8
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xf, 0x8).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 252: 0xffc
-    AtomicU16::new(RGBColour::from_12bit(0xf, 0xf, 0xc).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 253: 0xbbb
-    AtomicU16::new(RGBColour::from_12bit(0xb, 0xb, 0xb).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 254: 0x333
-    AtomicU16::new(RGBColour::from_12bit(0x3, 0x3, 0x3).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
     // Index 255: 0x777
-    AtomicU16::new(RGBColour::from_12bit(0x7, 0x7, 0x7).0),
+    AtomicU16::new(RGBColour::from_24bit(0x00, 0x00, 0x00).0),
 ];
 
 /// How many pixel pairs we send out.
@@ -1778,6 +1715,12 @@ const FIXED_CLOCKS_PER_TIMING_PULSE: u32 = 5;
 pub fn init(pio: super::pac::PIO0, dma: super::pac::DMA, resets: &mut super::pac::RESETS) {
     // Grab PIO0 and the state machines it contains
     let (mut pio, sm0, sm1, _sm2, _sm3) = pio.split(resets);
+
+    // Reset the DMA Peripheral.
+    resets.reset().modify(|_r, w| w.dma().set_bit());
+    cortex_m::asm::nop();
+    resets.reset().modify(|_r, w| w.dma().clear_bit());
+    while resets.reset_done().read().dma().bit_is_clear() {}
 
     // This program runs the timing loop. We post timing data (i.e. the length
     // of each period, along with what the H-Sync and V-Sync pins should do) and
@@ -1880,12 +1823,15 @@ pub fn init(pio: super::pac::PIO0, dma: super::pac::DMA, resets: &mut super::pac
     let (mut timing_sm, _, timing_fifo) =
         hal::pio::PIOBuilder::from_installed_program(timing_installed)
             .buffers(hal::pio::Buffers::OnlyTx)
-            .out_pins(0, 2) // H-Sync is GPIO0, V-Sync is GPIO1
+            .out_pins(16, 2) // H-Sync is GPIO16, V-Sync is GPIO17
             .autopull(true)
             .out_shift_direction(hal::pio::ShiftDirection::Right)
             .pull_threshold(32)
             .build(sm0);
-    timing_sm.set_pindirs([(0, hal::pio::PinDir::Output), (1, hal::pio::PinDir::Output)]);
+    timing_sm.set_pindirs([
+        (16, hal::pio::PinDir::Output),
+        (17, hal::pio::PinDir::Output),
+    ]);
 
     // Important notes!
     //
@@ -1898,12 +1844,12 @@ pub fn init(pio: super::pac::PIO0, dma: super::pac::DMA, resets: &mut super::pac
     let (mut pixel_sm, _, pixel_fifo) =
         hal::pio::PIOBuilder::from_installed_program(pixels_installed)
             .buffers(hal::pio::Buffers::OnlyTx)
-            .out_pins(2, 12) // Red0 is GPIO2, Blue3 is GPIO13
+            .out_pins(0, 16) // Red0 is GPIO0, Blue4 is GPIO15.
             .autopull(true)
             .out_shift_direction(hal::pio::ShiftDirection::Right)
             .pull_threshold(32) // We read all 32-bits in each FIFO word
             .build(sm1);
-    pixel_sm.set_pindirs((2..=13).map(|x| (x, hal::pio::PinDir::Output)));
+    pixel_sm.set_pindirs((0..=15).map(|x| (x, hal::pio::PinDir::Output)));
 
     pio.irq1().enable_sm_interrupt(1);
 
@@ -1974,16 +1920,6 @@ pub fn init(pio: super::pac::PIO0, dma: super::pac::DMA, resets: &mut super::pac
     CHUNKY4_COLOUR_LOOKUP.init(&VIDEO_PALETTE);
 }
 
-/// Sets the current video mode
-pub fn set_video_mode(mode: neotron_common_bios::video::Mode, vram: *mut u32) -> bool {
-    if test_video_mode(mode) {
-        VIDEO_MODE.set_mode(ModeInfo { mode, ptr: vram });
-        true
-    } else {
-        false
-    }
-}
-
 /// Check the given video mode is allowable
 pub fn test_video_mode(mode: neotron_common_bios::video::Mode) -> bool {
     if !mode.is_horiz_2x() {
@@ -2024,12 +1960,6 @@ pub fn get_scan_line() -> u16 {
     NEXT_SCAN_LINE.load(Ordering::Relaxed)
 }
 
-/// Get how many visible lines there currently are
-pub fn get_num_scan_lines() -> u16 {
-    let mode = VIDEO_MODE.get_mode().mode;
-    mode.vertical_lines()
-}
-
 /// Set a palette entry
 pub fn set_palette(index: u8, colour: RGBColour) {
     // Store it
@@ -2054,7 +1984,7 @@ pub fn get_palette(index: u8) -> RGBColour {
 pub fn render_loop(mut fifo: rp2040_hal::sio::SioFifo) -> ! {
     let mut render_engine = RenderEngine::new();
 
-    // The LED pin was condfigured in the code that ran on Core 0. Rather than
+    // The LED pin was configured in the code that ran on Core 0. Rather than
     // try and move the pin over to this core, we just unsafely poke the GPIO
     // registers to set/clear the relevant pin.
     let gpio_out_set = 0xd000_0014 as *mut u32;
@@ -2070,7 +2000,14 @@ pub fn render_loop(mut fifo: rp2040_hal::sio::SioFifo) -> ! {
                     0xA0 => {
                         let mode = unsafe { neotron_common_bios::video::Mode::from_u8(arg as u8) };
                         let ptr = fifo.read_blocking() as *mut u32;
-                        let result = set_video_mode(mode, ptr);
+
+                        let result = if test_video_mode(mode) {
+                            // save it for the next frame
+                            render_engine.new_video_mode = Some((mode, ptr));
+                            true
+                        } else {
+                            false
+                        };
                         fifo.write_blocking(result as u32);
                     }
                     0xA1 => {
@@ -2083,7 +2020,7 @@ pub fn render_loop(mut fifo: rp2040_hal::sio::SioFifo) -> ! {
                         fifo.write_blocking(scan_line as u32);
                     }
                     0xA3 => {
-                        let scan_lines = get_num_scan_lines();
+                        let scan_lines = render_engine.current_video_mode.vertical_lines();
                         fifo.write_blocking(scan_lines as u32);
                     }
                     0xA4 => {
@@ -2220,7 +2157,6 @@ unsafe fn PIO0_IRQ_1() {
         // The data will start pouring into the FIFO, but the output is corked until
         // the timing SM generates the second interrupt, just before the visible
         // portion.
-    } else {
     }
 
     // Set this before we set the `DRAW_THIS_LINE` flag.

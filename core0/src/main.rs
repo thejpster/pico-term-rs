@@ -17,7 +17,7 @@ use rp2040_hal::{
     self as hal, binary_info,
     clocks::Clock as _,
     fugit::RateExtU32 as _,
-    gpio::{self, bank0, FunctionPio0, FunctionUart, Pin, PullNone},
+    gpio::{self, bank0, FunctionPio0, FunctionSioOutput, FunctionUart, Pin, PullNone},
     pac,
     sio::Sio,
     watchdog::Watchdog,
@@ -41,13 +41,15 @@ pub static PICOTOOL_ENTRIES: [binary_info::EntryAddr; 5] = [
 /// On-board crystal frequency, in Hz.
 const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
 
-unsafe extern "C" {
-    /// This variable contains the address of the entry function
-    safe static CORE1_ENTRY: usize;
-    /// The top of Core 1's stack
-    safe static mut CORE1_STACK_TOP: usize;
-    /// The bottom of Core 1's stack
-    safe static mut CORE1_STACK_BOTTOM: usize;
+#[repr(C)]
+struct MiniVectorTable {
+    pub stack_pointer: usize,
+    pub reset_function: extern "C" fn() -> !,
+}
+
+extern "C" {
+    /// This is the start of Core1's vector table
+    static CORE1_VECTOR_TABLE: MiniVectorTable;
 }
 
 struct RedPins {
@@ -124,6 +126,8 @@ struct Hardware {
     _vga_pins: VgaPins,
     /// Our UART
     uart: hal::uart::UartPeripheral<hal::uart::Enabled, hal::pac::UART1, UartPins>,
+    /// Our blinky LED
+    _led: hal::gpio::Pin<bank0::Gpio25, FunctionSioOutput, PullNone>,
 }
 
 #[hal::entry]
@@ -135,7 +139,12 @@ fn main() -> ! {
     );
 
     let mut periph = pac::Peripherals::take().unwrap();
-    let cm = pac::CorePeripherals::take().unwrap();
+
+    // Check if stuff is running that shouldn't be. If so, do a full watchdog reboot.
+    if stuff_running(&mut periph) {
+        watchdog_reboot();
+    }
+
     let mut watchdog = Watchdog::new(periph.WATCHDOG);
     let mut sio = Sio::new(periph.SIO);
 
@@ -343,6 +352,7 @@ fn main() -> ! {
             // uart.enable_tx_interrupt();
             uart
         },
+        _led: { hal_pins.gpio25.reconfigure() },
     };
 
     info!("Setting up Core 1...");
@@ -358,14 +368,51 @@ fn main() -> ! {
         &mut sio.fifo,
     );
 
-    let mut delay = cortex_m::delay::Delay::new(cm.SYST, clocks.system_clock.freq().to_Hz());
-
     loop {
-        info!("Tick...");
-        delay.delay_ms(1000);
-        sio.fifo.write_blocking(0xA200_0000);
-        let result = sio.fifo.read_blocking();
-        info!("Sent A2, got {}", result);
+        let msg = sio.fifo.read_blocking();
+        info!("Got {=u32:08x} from Core 1", msg);
+    }
+}
+
+/// Check if the rest of the system appears to be running already.
+///
+/// If so, returns `true`, else `false`.
+///
+/// This probably means Core 0 reset but the rest of the system did not, and you
+/// should do a hard reset to get everything back into sync.
+fn stuff_running(p: &mut pac::Peripherals) -> bool {
+    // Look at scratch register 7 and see what we left ourselves. If it's zero,
+    // this was a full clean boot-up. If it's 0xDEADC0DE, this means we were
+    // running and Core 0 restarted without restarting everything else.
+    let scratch = p.WATCHDOG.scratch7().read().bits();
+    defmt::info!("WD Scratch is 0x{:08x}", scratch);
+    if scratch == 0xDEADC0DE {
+        // we need a hard reset
+        true
+    } else {
+        // set the marker so we know Core 0 has booted up
+        p.WATCHDOG
+            .scratch7()
+            .write(|w| unsafe { w.bits(0xDEADC0DE) });
+        false
+    }
+}
+
+/// Clear the scratch register so we don't force a full watchdog reboot on the
+/// next boot.
+fn clear_scratch() {
+    let p = unsafe { pac::Peripherals::steal() };
+    p.WATCHDOG.scratch7().write(|w| unsafe { w.bits(0) });
+}
+
+/// Do a full watchdog reboot
+fn watchdog_reboot() -> ! {
+    clear_scratch();
+    let p = unsafe { pac::Peripherals::steal() };
+    let mut watchdog = hal::Watchdog::new(p.WATCHDOG);
+    watchdog.start(fugit::Duration::<u32, 1, 1000000>::millis(10));
+    loop {
+        cortex_m::asm::wfi();
     }
 }
 
@@ -381,24 +428,29 @@ fn start_core1(
     ppb: &mut hal::pac::PPB,
     fifo: &mut hal::sio::SioFifo,
 ) {
+    static CORE1_STACK: rp2040_hal::multicore::Stack<4096> = rp2040_hal::multicore::Stack::new();
+
     let mut multicore = hal::multicore::Multicore::new(psm, ppb, fifo);
     let core1 = &mut multicore.cores()[1];
-    let stack_allocation = unsafe {
-        hal::multicore::StackAllocation::from_raw_parts(
-            core::ptr::addr_of_mut!(CORE1_STACK_BOTTOM),
-            core::ptr::addr_of_mut!(CORE1_STACK_TOP),
-        )
-    };
-    info!("Core 1 entry point is {=usize:08x}", CORE1_ENTRY);
+    let core1_vector_table = unsafe { &CORE1_VECTOR_TABLE };
+    info!(
+        "Core 1 sp=0x{=usize:08x}, reset=0x{=usize:08x}",
+        core1_vector_table.stack_pointer, core1_vector_table.reset_function as usize
+    );
     // off the top of the chip? (or blank...)
-    if CORE1_ENTRY > 0x1020_0000 {
-        defmt::panic!("Core1 entry address 0x{:08x} is bad?!", CORE1_ENTRY);
+    if core1_vector_table.stack_pointer < 0x2000_0000
+        || core1_vector_table.stack_pointer > 0x2004_2000
+    {
+        defmt::panic!(
+            "Core1 entry address 0x{:08x} is bad?!",
+            core1_vector_table.stack_pointer
+        );
     }
-    let entry_func: fn() -> ! = unsafe { core::mem::transmute(CORE1_ENTRY) };
     info!("Spawning Core 1...");
-    // start core 1
+    // start core 1 (although give them some stack - don't use their stack pointer)
+    let reset_func = core1_vector_table.reset_function;
     core1
-        .spawn(stack_allocation, move || entry_func())
+        .spawn(CORE1_STACK.take().unwrap(), move || reset_func())
         .expect("Spawning Core 1");
 }
 
