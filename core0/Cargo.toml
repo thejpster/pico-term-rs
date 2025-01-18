@@ -21,6 +21,9 @@ defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 rp2040-hal = { version = "0.11", features = ["rt", "critical-section-impl", "binary-info", "defmt", "rom-v2-intrinsics"] }
 rp2040-boot2 = "0.3"
+pio-proc = "0.2.2"
+pio = "0.2.1"
+fugit = "0.3.7"
 
 [profile.release]
 debug = 2

@@ -5,8 +5,15 @@ edition = "2021"
 
 [dependencies]
 cortex-m = "0.7.7"
+cortex-m-rt = "0.7.5"
 embedded-hal = "1.0.0"
+neotron-common-bios = "0.12.0"
+pio = "0.2.1"
+pio-proc = "0.2.2"
 rp2040-hal = { version="0.11", features=["rt", "critical-section-impl"] }
 
 [profile.release]
 debug = 2
+opt-level = "s"
+lto = "fat"
+codegen-units = 1

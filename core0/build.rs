@@ -28,6 +28,11 @@ fn main() {
     // here, we ensure the build script is only re-run when
     // `memory.x` is changed.
     println!("cargo:rerun-if-changed=memory.x");
+
+    // Tell the linker to use the cortex-m-rt linker script, which pulls in our
+    // memory.x, and the defmt linker script
+    println!("cargo::rustc-link-arg=-Tlink.x");
+    println!("cargo::rustc-link-arg=-Tdefmt.x");
 }
 
 // End of file
