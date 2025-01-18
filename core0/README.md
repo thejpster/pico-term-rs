@@ -21,9 +21,9 @@ Core 0 is responsible for:
 This firmware is based on the code for the [Neotron Pico], specifically parts of
 the [Neotron Pico BIOS] and the [Neotron OS].
 
-This firmware controls the first 1 MiB of Flash, and the first 256 KiB of SRAM.
-Global variables are at the top of SRAM and stack is underneath - this is
-handled using `flip-link`.
+This firmware controls the first 1 MiB of Flash, and the first ~200 KiB of SRAM
+(see [`memory.x`](./memory.x) for exactly how much). Note that the Flash and RAM
+regions for Core 0 and Core 1 must not overlap.
 
 ## Compiling
 

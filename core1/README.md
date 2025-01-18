@@ -13,12 +13,19 @@ Core 1 is responsible for:
 * Listening to a FIFO for commands from Core 0
   * Change video mode
   * Change buffer pointer
+  * Change font pointer
 
 This firmware is based on the code for the [Neotron Pico], specifically parts of
 the [Neotron Pico BIOS] and the [Neotron OS].
 
-This firmware controls the second 1 MiB of Flash, and the top 8 KiB of SRAM.
-We do not use `cortex-m-rt` or `flip-link` here.
+This firmware controls the second 1 MiB of Flash, and the top part of SRAM (see
+[`memory.x`](./memory.x) for exactly how much). Note that the Flash and RAM
+regions for Core 0 and Core 1 must not overlap.
+
+We flip the link using [`flip-link`](https://crates.io/crates/flip-link) so that
+we use as much of the uncontended Bank 4 and Bank 5 as possible. Our stack is
+actually a block of RAM allocated for us by Core 0 when it starts Core 1 up, so
+it's OK if we use basically all of our RAM allocation on global variables.
 
 ## Compiling
 

@@ -1,7 +1,16 @@
 [package]
 name = "core1"
 version = "0.1.0"
+authors = [
+    "Jonathan 'theJPster' Pallant <github@thejpster.org.uk>",
+    "The pico-term-rs Developers",
+    "The Neotron Developers"
+]
 edition = "2021"
+description = "Core1 Firmware for the RC2014 RP2024 VGA Terminal"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/thejpster/pico-term-rs"
 
 [dependencies]
 cortex-m = "0.7.7"
