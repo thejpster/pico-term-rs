@@ -33,7 +33,6 @@
 pub static FONT: super::Font = super::Font { data: &DATA };
 
 /// Our font data - arranged as 256 glyphs of 1 byte/row x 16 row/glyph.
-#[link_section = ".data"]
 static DATA: [u8; 256 * 16] = [
     // Char::Null
     0b0000_0000,

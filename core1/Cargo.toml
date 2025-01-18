@@ -23,3 +23,6 @@ rp2040-hal = { version="0.11", features=["rt", "critical-section-impl"] }
 
 [profile.release]
 debug = 2
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
