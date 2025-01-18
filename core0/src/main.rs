@@ -26,10 +26,11 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write;
+use core::{cell::UnsafeCell, fmt::Write};
 
 use defmt::*;
 use defmt_rtt as _;
+use embedded_hal::delay::DelayNs;
 use panic_probe as _;
 
 use rp2040_hal::{
@@ -41,6 +42,14 @@ use rp2040_hal::{
     sio::Sio,
     watchdog::Watchdog,
 };
+
+mod font16;
+mod font8;
+
+/// A font
+pub struct Font<'a> {
+    pub data: &'a [u8],
+}
 
 #[link_section = ".boot2"]
 #[no_mangle]
@@ -56,6 +65,78 @@ pub static PICOTOOL_ENTRIES: [binary_info::EntryAddr; 5] = [
     binary_info::rp_program_url!(c"https://github.com/thejpster/pico-term-rs"),
     binary_info::rp_program_build_attribute!(),
 ];
+
+static VIDEO_BUFFER: VideoBuffer = VideoBuffer::new();
+
+#[repr(align(4))]
+struct VideoBuffer {
+    contents: UnsafeCell<[u8; Self::LENGTH]>,
+}
+
+impl VideoBuffer {
+    const LENGTH: usize = 80 * 60 * 2;
+
+    pub const fn new() -> Self {
+        VideoBuffer {
+            contents: UnsafeCell::new([0u8; Self::LENGTH]),
+        }
+    }
+
+    pub fn get_ptr(&self) -> *const u32 {
+        // this type is align(4) so this is OK
+        self.contents.get() as *const u32
+    }
+
+    pub fn store_at(&self, ch: u8, attr: u8, x: u16, y: u16) {
+        if x >= 80 || y >= 60 {
+            return;
+        }
+        let ptr = self.contents.get() as *mut u8;
+        let offset = ((y * 80) + x) as usize * 2;
+        unsafe {
+            ptr.add(offset).write(ch);
+            ptr.add(offset).add(1).write(attr);
+        }
+    }
+}
+
+unsafe impl Sync for VideoBuffer {}
+
+static FONT_BUFFER: FontBuffer = FontBuffer::new();
+
+#[repr(align(4))]
+struct FontBuffer {
+    contents: UnsafeCell<[u8; Self::LENGTH]>,
+}
+
+impl FontBuffer {
+    const LENGTH: usize = 256 * 16;
+
+    pub const fn new() -> Self {
+        FontBuffer {
+            contents: UnsafeCell::new([0u8; Self::LENGTH]),
+        }
+    }
+
+    pub fn get_ptr(&self) -> *const u32 {
+        // this type is align(4) so this is OK
+        self.contents.get() as *const u32
+    }
+
+    pub fn load_font(&self, font: &Font) {
+        if font.data.len() > Self::LENGTH {
+            defmt::panic!("Font too long!?");
+        }
+        let ptr = self.contents.get() as *mut u8;
+        for (idx, b) in font.data.iter().enumerate() {
+            unsafe {
+                ptr.add(idx).write(*b);
+            }
+        }
+    }
+}
+
+unsafe impl Sync for FontBuffer {}
 
 /// On-board crystal frequency, in Hz.
 const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
@@ -229,6 +310,8 @@ fn main() -> ! {
 
     info!("Clocks OK!");
 
+    let mut delay = hal::timer::Timer::new(periph.TIMER, &mut periph.RESETS, &clocks);
+
     info!("Configuring pins...");
     let hal_pins = gpio::Pins::new(
         periph.IO_BANK0,
@@ -387,9 +470,84 @@ fn main() -> ! {
         &mut sio.fifo,
     );
 
+    // Load the 8x16 font first (so it isn't 'unused')
+    FONT_BUFFER.load_font(&font16::FONT);
+
+    // Now load the 8x8 font
+    FONT_BUFFER.load_font(&font8::FONT);
+
+    // Set video mode to 0x01 (640x480 @ 60Hz, 80x60, 8x8 font)
+    sio.fifo.write_blocking(0xA000_0001);
+    let msg = sio.fifo.read_blocking();
+    info!("Set video mode, got {=u32:08x} from Core 1", msg);
+
+    // Set framebuffer pointer
+    let command = 0xA100_0000;
+    let ptr = VIDEO_BUFFER.get_ptr() as u32;
+    let send = command | ((ptr - 0x2000_0000) >> 2);
+    sio.fifo.write_blocking(send);
+    let msg = sio.fifo.read_blocking();
+    info!(
+        "Set buffer pointer {=u32:08x}, got {=u32:08x} from Core 1",
+        send, msg
+    );
+
+    // Set font pointer
+    let command = 0xA200_0000;
+    let ptr = FONT_BUFFER.get_ptr() as u32;
+    let send = command | ((ptr - 0x2000_0000) >> 2);
+    sio.fifo.write_blocking(send);
+    let msg = sio.fifo.read_blocking();
+    info!(
+        "Set font pointer {=u32:08x}, got {=u32:08x} from Core 1",
+        send, msg
+    );
+
+    let fg_colours = [
+        neotron_common_bios::video::TextForegroundColour::Black,
+        neotron_common_bios::video::TextForegroundColour::Blue,
+        neotron_common_bios::video::TextForegroundColour::Green,
+        neotron_common_bios::video::TextForegroundColour::Cyan,
+        neotron_common_bios::video::TextForegroundColour::Red,
+        neotron_common_bios::video::TextForegroundColour::Magenta,
+        neotron_common_bios::video::TextForegroundColour::Brown,
+        neotron_common_bios::video::TextForegroundColour::LightGray,
+        neotron_common_bios::video::TextForegroundColour::DarkGray,
+        neotron_common_bios::video::TextForegroundColour::LightBlue,
+        neotron_common_bios::video::TextForegroundColour::LightGreen,
+        neotron_common_bios::video::TextForegroundColour::LightCyan,
+        neotron_common_bios::video::TextForegroundColour::LightRed,
+        neotron_common_bios::video::TextForegroundColour::Pink,
+        neotron_common_bios::video::TextForegroundColour::Yellow,
+        neotron_common_bios::video::TextForegroundColour::White,
+    ];
+    let bg_colours = [
+        neotron_common_bios::video::TextBackgroundColour::Black,
+        neotron_common_bios::video::TextBackgroundColour::Blue,
+        neotron_common_bios::video::TextBackgroundColour::Green,
+        neotron_common_bios::video::TextBackgroundColour::Cyan,
+        neotron_common_bios::video::TextBackgroundColour::Red,
+        neotron_common_bios::video::TextBackgroundColour::Magenta,
+        neotron_common_bios::video::TextBackgroundColour::Brown,
+        neotron_common_bios::video::TextBackgroundColour::LightGray,
+    ];
+
+    let mut fg_iter = fg_colours.iter().cycle();
+    let mut bg_iter = bg_colours.iter().cycle();
+    let mut ch_iter = (0..=255).cycle();
+
     loop {
-        let msg = sio.fifo.read_blocking();
-        info!("Got {=u32:08x} from Core 1", msg);
+        for y in 0..60 {
+            let bg = bg_iter.next().unwrap();
+            for x in 0..80 {
+                let fg = fg_iter.next().unwrap();
+                let ch = ch_iter.next().unwrap();
+                let attr = neotron_common_bios::video::Attr::new(*fg, *bg, false);
+                VIDEO_BUFFER.store_at(ch, attr.as_u8(), x, y);
+                // let's do 100 chars per second
+                delay.delay_ms(10);
+            }
+        }
     }
 }
 

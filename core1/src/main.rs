@@ -89,7 +89,11 @@ unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
     fifo_write(frame.r12());
     fifo_write(frame.lr());
     fifo_write(frame.pc());
-    loop {}
+    loop {
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
 }
 
 #[panic_handler]
@@ -100,7 +104,11 @@ fn panic_handler(info: &core::panic::PanicInfo) -> ! {
     } else {
         fifo_write(0xDDDD_0002);
     }
-    loop {}
+    loop {
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
 }
 
 fn fifo_ready() -> bool {

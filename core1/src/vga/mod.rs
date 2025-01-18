@@ -35,8 +35,6 @@
 // Sub-modules
 // -----------------------------------------------------------------------------
 
-mod font16;
-mod font8;
 mod rgb;
 
 // -----------------------------------------------------------------------------
@@ -49,6 +47,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
 };
 use neotron_common_bios::video::{Attr, GlyphAttr, TextBackgroundColour, TextForegroundColour};
+use rp2040_hal::sio::SioFifo;
 
 use core::sync::atomic::AtomicUsize;
 pub use rgb::{RGBColour, RGBPair};
@@ -56,11 +55,6 @@ pub use rgb::{RGBColour, RGBPair};
 // -----------------------------------------------------------------------------
 // Types
 // -----------------------------------------------------------------------------
-
-/// A font
-pub struct Font<'a> {
-    data: &'a [u8],
-}
 
 /// Describes the polarity of a sync pulse.
 ///
@@ -99,8 +93,8 @@ struct RenderEngine {
     current_video_mode: neotron_common_bios::video::Mode,
     /// The current framebuffer pointer
     current_video_ptr: *const u32,
-    /// The current video mode
-    new_video_mode: Option<(neotron_common_bios::video::Mode, *const u32)>,
+    /// The current font pointer
+    current_font_ptr: *const u32,
     /// How many rows of text are we showing right now
     num_text_rows: usize,
     /// How many columns of text are we showing right now
@@ -114,32 +108,110 @@ impl RenderEngine {
             frame_count: 0,
             // Should match the default value of TIMING_BUFFER and VIDEO_MODE
             current_video_mode: unsafe { neotron_common_bios::video::Mode::from_u8(1) },
-            // this is basically random, but also we're trying to avoid the
-            // bottom of our stack, because the MPU won't let us read the bottom
-            // of the stack as a means of stack overflow protection.
-            current_video_ptr: 0x2003b000 as *const u32,
-            new_video_mode: None,
-            // Should match the mode above
-            num_text_cols: 80,
-            num_text_rows: 30,
+            current_video_ptr: core::ptr::null(),
+            current_font_ptr: core::ptr::null(),
+            num_text_cols: 0,
+            num_text_rows: 0,
         }
     }
 
-    /// Do the start-of-frame setup
-    #[link_section = ".data"]
-    fn frame_start(&mut self) {
+    /// Call this once per frame
+    pub fn new_frame(&mut self, fifo: &mut SioFifo) {
         self.frame_count += 1;
-        // Update video mode only on first line of video
-        if let Some((mode, ptr)) = self.new_video_mode {
-            self.current_video_mode = mode;
-            self.current_video_ptr = ptr;
+        while let Some(read_value) = fifo.read() {
+            let command = read_value >> 24;
+            let arg = read_value & 0xFF_FFFF;
+            match command {
+                // Change video mode
+                0xA0 => {
+                    let mode = unsafe { neotron_common_bios::video::Mode::from_u8(arg as u8) };
+                    let result = if test_video_mode(mode) {
+                        // let's go!
+                        self.current_video_mode = mode;
+                        // Tell the ISR to now generate our newly chosen timing
+                        CURRENT_TIMING_MODE
+                            .store(self.current_video_mode.timing() as usize, Ordering::Relaxed);
+                        DOUBLE_SCAN_MODE
+                            .store(self.current_video_mode.is_vert_2x(), Ordering::Relaxed);
+                        // set up our text console to be the right size
+                        self.num_text_cols =
+                            self.current_video_mode.text_width().unwrap_or(0) as usize;
+                        self.num_text_rows =
+                            self.current_video_mode.text_height().unwrap_or(0) as usize;
+                        // success
+                        1
+                    } else {
+                        // failure
+                        0
+                    };
+                    fifo.write_blocking(result);
+                }
+                // Change framebuffer pointer
+                0xA1 => {
+                    // pointers are 32-bit aligned so we shave two bits off to store a 26-bit pointer
+                    let ptr = (arg << 2) as usize;
+                    // add on the standard Cortex-M SRAM base address
+                    let ptr = ptr + 0x2000_0000_usize;
+                    // how big is this buffer?
+                    let ptr_end = ptr + self.current_video_mode.frame_size_bytes();
+                    let result = if SRAM_RANGE.contains(&ptr) && SRAM_RANGE.contains(&ptr_end) {
+                        // well I guess it looks OK
+                        self.current_video_ptr = ptr as *const u32;
+                        1
+                    } else {
+                        0
+                    };
+                    fifo.write_blocking(result);
+                }
+                // Change font pointer
+                0xA2 => {
+                    // pointers are 32-bit aligned so we shave two bits off to store a 26-bit pointer
+                    let ptr = (arg << 2) as usize;
+                    // add on the standard Cortex-M SRAM base address
+                    let ptr = ptr + 0x2000_0000_usize;
+                    // how big is this buffer?
+                    let ptr_end = ptr + self.current_video_mode.frame_size_bytes();
+                    let result = if SRAM_RANGE.contains(&ptr) && SRAM_RANGE.contains(&ptr_end) {
+                        // well I guess it looks OK
+                        self.current_font_ptr = ptr as *const u32;
+                        1
+                    } else {
+                        0
+                    };
+                    fifo.write_blocking(result);
+                }
+                // Test a video mode
+                0xA3 => {
+                    let mode = unsafe { neotron_common_bios::video::Mode::from_u8(arg as u8) };
+                    let result = if test_video_mode(mode) { 1 } else { 0 };
+                    fifo.write_blocking(result as u32);
+                }
+                // Get current scan-line
+                0xA4 => {
+                    let scan_line = get_scan_line();
+                    fifo.write_blocking(scan_line as u32);
+                }
+                // Set a palette entry (packed as [ command | arg | 16-bit colour ])
+                0xA5 => {
+                    let index = arg as u8;
+                    let rgb = (arg >> 8) as u16;
+                    set_palette(index, RGBColour(rgb));
+                }
+                // Get a palette entry
+                0xA6 => {
+                    let index = arg as u8;
+                    let rgb = get_palette(index);
+                    fifo.write_blocking(rgb.0 as u32);
+                }
+                // Get the frame count
+                0xA7 => {
+                    fifo.write_blocking(self.frame_count);
+                }
+                _ => {
+                    // ignored
+                }
+            }
         }
-        // Tell the ISR to now generate our newly chosen timing
-        CURRENT_TIMING_MODE.store(self.current_video_mode.timing() as usize, Ordering::Relaxed);
-        DOUBLE_SCAN_MODE.store(self.current_video_mode.is_vert_2x(), Ordering::Relaxed);
-        // set up our text console to be the right size
-        self.num_text_cols = self.current_video_mode.text_width().unwrap_or(0) as usize;
-        self.num_text_rows = self.current_video_mode.text_height().unwrap_or(0) as usize;
     }
 
     /// Draw a line of pixels into the relevant pixel buffer (either
@@ -147,7 +219,12 @@ impl RenderEngine {
     ///
     /// The `current_line_num` goes from `0..NUM_LINES`.
     #[link_section = ".data"]
-    pub fn draw_next_line(&mut self, current_line_num: u16) {
+    pub fn draw_next_line(&mut self, mut current_line_num: u16) {
+        if self.current_video_mode.is_vert_2x() {
+            // in double scan mode we only draw ever other line
+            current_line_num >>= 1;
+        }
+
         // Pick a buffer to render into based on the line number we are drawing.
         // It's safe to write to this buffer because it's the the other one that
         // is currently being DMA'd out to the Pixel SM.
@@ -157,14 +234,19 @@ impl RenderEngine {
             &PIXEL_DATA_BUFFER_ODD
         };
 
+        if self.current_video_ptr.is_null() {
+            // do nothing
+            return;
+        }
+
         match self.current_video_mode.format() {
             neotron_common_bios::video::Format::Text8x16 => {
                 // Text with 8x16 glyphs
-                self.draw_next_line_text::<16>(&font16::FONT, scan_line_buffer, current_line_num)
+                self.draw_next_line_text::<16>(scan_line_buffer, current_line_num)
             }
             neotron_common_bios::video::Format::Text8x8 => {
                 // Text with 8x8 glyphs
-                self.draw_next_line_text::<8>(&font8::FONT, scan_line_buffer, current_line_num)
+                self.draw_next_line_text::<8>(scan_line_buffer, current_line_num)
             }
             neotron_common_bios::video::Format::Chunky1 => {
                 // Bitmap with 1 bit per pixel
@@ -542,10 +624,13 @@ impl RenderEngine {
     #[link_section = ".data"]
     pub fn draw_next_line_text<const GLYPH_HEIGHT: usize>(
         &mut self,
-        font: &Font,
         scan_line_buffer: &LineBuffer,
         current_line_num: u16,
     ) {
+        if self.current_font_ptr.is_null() {
+            // draw nothing
+            return;
+        }
         // Convert our position in scan-lines to a text row, and a line within each glyph on that row
         let text_row = current_line_num as usize / GLYPH_HEIGHT;
         let font_row = current_line_num as usize % GLYPH_HEIGHT;
@@ -566,7 +651,8 @@ impl RenderEngine {
         // is the same for every glyph on this row, we calculate a
         // new pointer once, in advance, and save ourselves an
         // addition each time around the loop.
-        let font_ptr = unsafe { font.data.as_ptr().add(font_row) };
+        let font_ptr = self.current_font_ptr as *const u8;
+        let font_ptr = unsafe { font_ptr.add(font_row) };
 
         // Get a pointer into our scan-line buffer
         let mut scan_line_buffer_ptr = scan_line_buffer.pixel_ptr();
@@ -1098,6 +1184,9 @@ impl Chunky4ColourLookup {
 // -----------------------------------------------------------------------------
 // Static and Const Data
 // -----------------------------------------------------------------------------
+
+/// Any valid framebuffer or font pointer will be in this range
+const SRAM_RANGE: core::ops::Range<usize> = 0x2000_0000..0x2004_2000;
 
 /// How many pixels per scan-line.
 ///
@@ -1718,7 +1807,9 @@ pub fn init(pio: super::pac::PIO0, dma: super::pac::DMA, resets: &mut super::pac
 
     // Reset the DMA Peripheral.
     resets.reset().modify(|_r, w| w.dma().set_bit());
-    cortex_m::asm::nop();
+    unsafe {
+        core::arch::asm!("nop");
+    }
     resets.reset().modify(|_r, w| w.dma().clear_bit());
     while resets.reset_done().read().dma().bit_is_clear() {}
 
@@ -1993,65 +2084,14 @@ pub fn render_loop(mut fifo: rp2040_hal::sio::SioFifo) -> ! {
     loop {
         // Wait for a free DMA buffer. Can't do a compare-and-swap on ARMv6-M :/
         while !DRAW_THIS_LINE.load(Ordering::Acquire) {
-            if let Some(value) = fifo.read() {
-                let command = value >> 24;
-                let arg = value & 0xFF_FFFF;
-                match command {
-                    0xA0 => {
-                        let mode = unsafe { neotron_common_bios::video::Mode::from_u8(arg as u8) };
-                        let ptr = fifo.read_blocking() as *mut u32;
-
-                        let result = if test_video_mode(mode) {
-                            // save it for the next frame
-                            render_engine.new_video_mode = Some((mode, ptr));
-                            true
-                        } else {
-                            false
-                        };
-                        fifo.write_blocking(result as u32);
-                    }
-                    0xA1 => {
-                        let mode = unsafe { neotron_common_bios::video::Mode::from_u8(arg as u8) };
-                        let result = test_video_mode(mode);
-                        fifo.write_blocking(result as u32);
-                    }
-                    0xA2 => {
-                        let scan_line = get_scan_line();
-                        fifo.write_blocking(scan_line as u32);
-                    }
-                    0xA3 => {
-                        let scan_lines = render_engine.current_video_mode.vertical_lines();
-                        fifo.write_blocking(scan_lines as u32);
-                    }
-                    0xA4 => {
-                        let index = arg as u8;
-                        let rgb = (arg >> 8) as u16;
-                        set_palette(index, RGBColour(rgb));
-                    }
-                    0xA5 => {
-                        let index = arg as u8;
-                        let rgb = get_palette(index);
-                        fifo.write_blocking(rgb.0 as u32);
-                    }
-                    _ => {
-                        // ignored
-                    }
-                }
+            unsafe {
+                core::arch::asm!("wfe");
             }
         }
         DRAW_THIS_LINE.store(false, Ordering::Relaxed);
 
         // The one we draw *now* is the one that is *shown* next
-        let mut this_line = NEXT_SCAN_LINE.load(Ordering::Relaxed);
-
-        if this_line == 0 {
-            render_engine.frame_start();
-        }
-
-        if render_engine.current_video_mode.is_vert_2x() {
-            // in double scan mode we only draw ever other line
-            this_line >>= 1;
-        }
+        let this_line = NEXT_SCAN_LINE.load(Ordering::Relaxed);
 
         unsafe {
             // Turn on LED
@@ -2065,6 +2105,11 @@ pub fn render_loop(mut fifo: rp2040_hal::sio::SioFifo) -> ! {
         unsafe {
             // Turn off LED
             gpio_out_clr.write(1 << 25);
+        }
+
+        // we've just drawn the last visible line, so let's take a moment to inspect the FIFO
+        if this_line == (render_engine.current_video_mode.vertical_lines() - 1) {
+            render_engine.new_frame(&mut fifo)
         }
     }
 }
