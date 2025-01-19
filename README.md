@@ -25,14 +25,12 @@ There are three Rust applications here:
 
 * [xtask](./xtask) - a build tool that builds this firmware
 * [core0](./core0) - an application that runs on Core 0
-  * Controls the first 1 MiB of Flash, and the first 256 KiB of SRAM.
+  * Uses the first 256 KiB of Flash, and the first 256 KiB of SRAM.
   * Global variables are at the top of SRAM and stack is underneath.
   * Boots first, and is responsible for starting Core 1
 * [core1](./core1) - an application that runs on Core 1
-  * Controls the second 1 MiB of Flash, and the top 8 KiB of SRAM
-  * Stack is in SRAM Bank 5
-  * Global data is in SRAM Bank 4
-* Core 0 and Core 1 communicate by message-passing using the FIFO
+  * Controls the second 256 KiB of Flash, and the top 8 KiB of SRAM
+* Core 0 and Core 1 communicate by message-passing using the SIO FIFO
 
 ## Compiling
 
