@@ -65,8 +65,6 @@ fn main() -> ! {
 
     let mut hw = hw::Hardware::init();
 
-    let _ = writeln!(hw.uart, "Hello UART!");
-
     // Load the 8x16 font
     vga::FONT_BUFFER.load_font(&vga::font16::FONT);
 
@@ -99,23 +97,63 @@ fn main() -> ! {
         msg
     );
 
-    let mut vte: vte::Parser<16> = vte::Parser::new_with_size();
-
-    let mut console = unsafe { Console::new(80, 30) };
-
-    console.clear();
-    console.cursor_enable();
+    let mut console = Console::new(80, 30);
+    console.inner.clear();
+    _ = write!(console, "\u{001b}[?25h");
+    _ = write!(console, "\u{001b}[2J");
+    _ = writeln!(console, "\u{001b}[1m\u{001b}[31mp\u{001b}[32mi\u{001b}[33mc\u{001b}[34mo\u{001b}[0m-term-rs. Licensed under the GPL. 115,200 baud.");
 
     loop {
         let mut buffer = [0u8; 1];
         if let Ok(1) = hw.uart.read_raw(&mut buffer) {
-            // defmt::info!("Got {:02x} ({})", buffer[0], buffer[0] as char);
-            vte.advance(&mut console, buffer[0]);
+            console.write(&buffer);
         }
     }
 }
 
 struct Console {
+    inner: ConsoleInner,
+    vte: vte::Parser<16>,
+}
+
+impl Console {
+    /// Create a new console
+    pub fn new(width: u16, height: u16) -> Console {
+        Console {
+            inner: ConsoleInner {
+                width_chars: width,
+                height_chars: height,
+                col: 0,
+                row: 0,
+                attr: ConsoleInner::DEFAULT_ATTR,
+                bright: false,
+                reverse: false,
+                cursor_wanted: false,
+                cursor_depth: 0,
+                cursor_holder: None,
+            },
+            vte: vte::Parser::new_with_size(),
+        }
+    }
+
+    /// Process a byte
+    pub fn write(&mut self, bytes: &[u8]) {
+        self.inner.cursor_disable();
+        for b in bytes.iter() {
+            self.vte.advance(&mut self.inner, *b);
+        }
+        self.inner.cursor_enable();
+    }
+}
+
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+struct ConsoleInner {
     /// The width of the screen in characters
     width_chars: u16,
     /// The height of the screen in characters
@@ -140,32 +178,12 @@ struct Console {
     cursor_holder: Option<u8>,
 }
 
-impl Console {
+impl ConsoleInner {
     const DEFAULT_ATTR: Attr = Attr::new(
         TextForegroundColour::LightGray,
         TextBackgroundColour::Black,
         false,
     );
-
-    /// Create a new console
-    ///
-    /// # Safety
-    ///  
-    /// `addr` must point to a buffer of at least `width * height * 2`` bytes.
-    pub unsafe fn new(width: u16, height: u16) -> Console {
-        Console {
-            width_chars: width,
-            height_chars: height,
-            col: 0,
-            row: 0,
-            attr: Self::DEFAULT_ATTR,
-            bright: false,
-            reverse: false,
-            cursor_wanted: false,
-            cursor_depth: 0,
-            cursor_holder: None,
-        }
-    }
 
     /// Replace the glyph at the current location with a cursor.
     fn cursor_enable(&mut self) {
@@ -501,7 +519,7 @@ impl Console {
     }
 }
 
-impl vte::Perform for Console {
+impl vte::Perform for ConsoleInner {
     /// Draw a character to the screen and update states.
     fn print(&mut self, ch: char) {
         self.scroll_as_required();
@@ -528,6 +546,7 @@ impl vte::Perform for Console {
                 self.col = (self.col + 8) & !7;
             }
             b'\n' => {
+                // Every \n is an implicit \r
                 self.col = 0;
                 self.row += 1;
             }
