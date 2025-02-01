@@ -26,35 +26,24 @@
 #![no_std]
 #![no_main]
 
-use core::{cell::UnsafeCell, fmt::Write};
+use core::{fmt::Write, sync::atomic::AtomicBool};
 
-use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::delay::DelayNs;
+use neotron_common_bios::video::{Attr, TextBackgroundColour, TextForegroundColour};
 use panic_probe as _;
 
-use rp2040_hal::{
-    self as hal, binary_info,
-    clocks::Clock as _,
-    fugit::RateExtU32 as _,
-    gpio::{self, bank0, FunctionPio0, FunctionSioOutput, FunctionUart, Pin, PullNone},
-    pac,
-    sio::Sio,
-    watchdog::Watchdog,
-};
+use rp2040_hal::{self as hal, binary_info};
 
-mod font16;
-mod font8;
-
-/// A font
-pub struct Font<'a> {
-    pub data: &'a [u8],
-}
+mod hw;
+mod vga;
 
 #[link_section = ".boot2"]
 #[no_mangle]
 #[used]
 pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+
+/// Are we rendering a panic right now?
+pub static IS_PANIC: AtomicBool = AtomicBool::new(false);
 
 #[link_section = ".bi_entries"]
 #[used]
@@ -66,569 +55,742 @@ pub static PICOTOOL_ENTRIES: [binary_info::EntryAddr; 5] = [
     binary_info::rp_program_build_attribute!(),
 ];
 
-static VIDEO_BUFFER: VideoBuffer = VideoBuffer::new();
-
-#[repr(align(4))]
-struct VideoBuffer {
-    contents: UnsafeCell<[u8; Self::LENGTH]>,
-}
-
-impl VideoBuffer {
-    const LENGTH: usize = 80 * 60 * 2;
-
-    pub const fn new() -> Self {
-        VideoBuffer {
-            contents: UnsafeCell::new([0u8; Self::LENGTH]),
-        }
-    }
-
-    pub fn get_ptr(&self) -> *const u32 {
-        // this type is align(4) so this is OK
-        self.contents.get() as *const u32
-    }
-
-    pub fn store_at(&self, ch: u8, attr: u8, x: u16, y: u16) {
-        if x >= 80 || y >= 60 {
-            return;
-        }
-        let ptr = self.contents.get() as *mut u8;
-        let offset = ((y * 80) + x) as usize * 2;
-        unsafe {
-            ptr.add(offset).write(ch);
-            ptr.add(offset).add(1).write(attr);
-        }
-    }
-}
-
-unsafe impl Sync for VideoBuffer {}
-
-static FONT_BUFFER: FontBuffer = FontBuffer::new();
-
-#[repr(align(4))]
-struct FontBuffer {
-    contents: UnsafeCell<[u8; Self::LENGTH]>,
-}
-
-impl FontBuffer {
-    const LENGTH: usize = 256 * 16;
-
-    pub const fn new() -> Self {
-        FontBuffer {
-            contents: UnsafeCell::new([0u8; Self::LENGTH]),
-        }
-    }
-
-    pub fn get_ptr(&self) -> *const u32 {
-        // this type is align(4) so this is OK
-        self.contents.get() as *const u32
-    }
-
-    pub fn load_font(&self, font: &Font) {
-        if font.data.len() > Self::LENGTH {
-            defmt::panic!("Font too long!?");
-        }
-        let ptr = self.contents.get() as *mut u8;
-        for (idx, b) in font.data.iter().enumerate() {
-            unsafe {
-                ptr.add(idx).write(*b);
-            }
-        }
-    }
-}
-
-unsafe impl Sync for FontBuffer {}
-
-/// On-board crystal frequency, in Hz.
-const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
-
-#[repr(C)]
-struct MiniVectorTable {
-    pub stack_pointer: usize,
-    pub reset_function: extern "C" fn() -> !,
-}
-
-extern "C" {
-    /// This is the start of Core1's vector table
-    static CORE1_VECTOR_TABLE: MiniVectorTable;
-}
-
-struct RedPins {
-    /// Red colour data bit 0 (the LSB)
-    ///
-    /// Also connected to a pull-up button. We should sample this as an input
-    /// during the vertical blanking interval.
-    _bit0: Pin<bank0::Gpio0, FunctionPio0, PullNone>,
-    /// Red colour data bit 1
-    _bit1: Pin<bank0::Gpio1, FunctionPio0, PullNone>,
-    /// Red colour data bit 2
-    _bit2: Pin<bank0::Gpio2, FunctionPio0, PullNone>,
-    /// Red colour data bit 3
-    _bit3: Pin<bank0::Gpio3, FunctionPio0, PullNone>,
-    /// Red colour data bit 4 (the MSB)
-    _bit4: Pin<bank0::Gpio4, FunctionPio0, PullNone>,
-}
-
-struct GreenPins {
-    /// Green colour data bit 0 (the LSB)
-    ///
-    /// Also connected to a pull-up button. We should sample this as an input
-    /// during the vertical blanking interval.
-    _bit0: Pin<bank0::Gpio6, FunctionPio0, PullNone>,
-    /// Green colour data bit 1
-    _bit1: Pin<bank0::Gpio7, FunctionPio0, PullNone>,
-    /// Green colour data bit 2
-    _bit2: Pin<bank0::Gpio8, FunctionPio0, PullNone>,
-    /// Green colour data bit 3
-    _bit3: Pin<bank0::Gpio9, FunctionPio0, PullNone>,
-    /// Green colour data bit 4 (the MSB)
-    _bit4: Pin<bank0::Gpio10, FunctionPio0, PullNone>,
-}
-
-struct BluePins {
-    /// Blue colour data bit 0 (the LSB)
-    ///
-    /// Also connected to a pull-up button. We should sample this as an input
-    /// during the vertical blanking interval.
-    _bit0: Pin<bank0::Gpio11, FunctionPio0, PullNone>,
-    /// Blue colour data bit 1
-    _bit1: Pin<bank0::Gpio12, FunctionPio0, PullNone>,
-    /// Blue colour data bit 2
-    _bit2: Pin<bank0::Gpio13, FunctionPio0, PullNone>,
-    /// Blue colour data bit 3
-    _bit3: Pin<bank0::Gpio14, FunctionPio0, PullNone>,
-    /// Blue colour data bit 4 (the MSB)
-    _bit4: Pin<bank0::Gpio15, FunctionPio0, PullNone>,
-}
-
-struct VgaPins {
-    /// Analog value for the red channel, over five bits
-    _red_pins: RedPins,
-    /// Analog value for the green channel, over five bits
-    _green_pins: GreenPins,
-    /// Analog value for the blue channel, over five bits
-    _blue_pins: BluePins,
-    /// Horizontal Sync pin
-    _h_sync: Pin<bank0::Gpio16, FunctionPio0, PullNone>,
-    /// Vertical Sync pin
-    _v_sync: Pin<bank0::Gpio17, FunctionPio0, PullNone>,
-}
-
-type UartTx = Pin<bank0::Gpio20, FunctionUart, PullNone>;
-type UartRx = Pin<bank0::Gpio21, FunctionUart, PullNone>;
-type UartPins = (UartTx, UartRx);
-
-struct Hardware {
-    /// Our pins for VGA video output
-    ///
-    /// These pins are all controlled by PIO0, which is driven from the Core 1
-    /// firmware. We just set them up on this side whilst we set up all the
-    /// other pins.
-    _vga_pins: VgaPins,
-    /// Our UART
-    uart: hal::uart::UartPeripheral<hal::uart::Enabled, hal::pac::UART1, UartPins>,
-    /// Our blinky LED
-    _led: hal::gpio::Pin<bank0::Gpio25, FunctionSioOutput, PullNone>,
-}
-
 #[hal::entry]
 fn main() -> ! {
-    info!(
+    defmt::info!(
         "Firmware {} {} starting up",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
 
-    let mut periph = pac::Peripherals::take().unwrap();
-
-    // Check if stuff is running that shouldn't be. If so, do a full watchdog reboot.
-    if stuff_running(&mut periph) {
-        watchdog_reboot();
-    }
-
-    let mut watchdog = Watchdog::new(periph.WATCHDOG);
-    let mut sio = Sio::new(periph.SIO);
-
-    info!("Configuring clocks...");
-
-    // Run at 151.2 MHz SYS_PLL, 48 MHz, USB_PLL. This is important, we as clock
-    // the PIO at ÷ 6, to give 25.2 MHz (which is close enough to the 25.175
-    // MHz standard VGA pixel clock).
-
-    // Step 1. Turn on the crystal.
-    let xosc = hal::xosc::setup_xosc_blocking(periph.XOSC, XOSC_CRYSTAL_FREQ.Hz())
-        .map_err(|_x| false)
-        .unwrap();
-    // Step 2. Configure watchdog tick generation to tick over every microsecond.
-    watchdog.enable_tick_generation((XOSC_CRYSTAL_FREQ / 1_000_000) as u8);
-    // Step 3. Create a clocks manager.
-    let mut clocks = hal::clocks::ClocksManager::new(periph.CLOCKS);
-    // Step 4. Set up the system PLL.
-    //
-    // We take the Crystal Oscillator (=12 MHz) with no divider, and ×126 to
-    // give a FOUTVCO of 1512 MHz. This must be in the range 750 MHz - 1600 MHz.
-    // The factor of 126 is calculated automatically given the desired FOUTVCO.
-    //
-    // Next we ÷5 on the first post divider to give 302.4 MHz.
-    //
-    // Finally we ÷2 on the second post divider to give 151.2 MHz.
-    //
-    // We note from the [RP2040
-    // Datasheet](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf),
-    // Section 2.18.2.1:
-    //
-    // > Jitter is minimised by running the VCO at the highest possible
-    // > frequency, so that higher post-divide values can be used.
-    let pll_sys = hal::pll::setup_pll_blocking(
-        periph.PLL_SYS,
-        xosc.operating_frequency(),
-        hal::pll::PLLConfig {
-            vco_freq: 1512.MHz(),
-            refdiv: 1,
-            post_div1: 5,
-            post_div2: 2,
-        },
-        &mut clocks,
-        &mut periph.RESETS,
-    )
-    .map_err(|_x| false)
-    .unwrap();
-    // Step 5. Set up a 48 MHz PLL for the USB system.
-    let pll_usb = hal::pll::setup_pll_blocking(
-        periph.PLL_USB,
-        xosc.operating_frequency(),
-        hal::pll::common_configs::PLL_USB_48MHZ,
-        &mut clocks,
-        &mut periph.RESETS,
-    )
-    .map_err(|_x| false)
-    .unwrap();
-    // Step 6. Set the system to run from the PLLs we just configured.
-    clocks
-        .init_default(&xosc, &pll_sys, &pll_usb)
-        .map_err(|_x| false)
-        .unwrap();
-
-    info!("Clocks OK!");
-
-    let mut delay = hal::timer::Timer::new(periph.TIMER, &mut periph.RESETS, &clocks);
-
-    info!("Configuring pins...");
-    let hal_pins = gpio::Pins::new(
-        periph.IO_BANK0,
-        periph.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut periph.RESETS,
-    );
-    let mut hw = Hardware {
-        _vga_pins: VgaPins {
-            _red_pins: RedPins {
-                _bit0: {
-                    let mut pin = hal_pins.gpio0.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit1: {
-                    let mut pin = hal_pins.gpio1.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit2: {
-                    let mut pin = hal_pins.gpio2.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit3: {
-                    let mut pin = hal_pins.gpio3.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit4: {
-                    let mut pin = hal_pins.gpio4.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-            },
-            _green_pins: GreenPins {
-                _bit0: {
-                    let mut pin = hal_pins.gpio6.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit1: {
-                    let mut pin = hal_pins.gpio7.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit2: {
-                    let mut pin = hal_pins.gpio8.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit3: {
-                    let mut pin = hal_pins.gpio9.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit4: {
-                    let mut pin = hal_pins.gpio10.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-            },
-            _blue_pins: BluePins {
-                _bit0: {
-                    let mut pin = hal_pins.gpio11.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit1: {
-                    let mut pin = hal_pins.gpio12.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit2: {
-                    let mut pin = hal_pins.gpio13.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit3: {
-                    let mut pin = hal_pins.gpio14.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-                _bit4: {
-                    let mut pin = hal_pins.gpio15.reconfigure();
-                    pin.set_drive_strength(hal::gpio::OutputDriveStrength::EightMilliAmps);
-                    pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                    pin
-                },
-            },
-            _h_sync: {
-                let mut pin = hal_pins.gpio16.reconfigure();
-                // todo: is this required?
-                pin.set_drive_strength(gpio::OutputDriveStrength::EightMilliAmps);
-                pin.set_slew_rate(gpio::OutputSlewRate::Fast);
-                pin
-            },
-            _v_sync: {
-                let mut pin = hal_pins.gpio17.reconfigure();
-                // todo: is this required?
-                pin.set_drive_strength(gpio::OutputDriveStrength::EightMilliAmps);
-                pin.set_slew_rate(gpio::OutputSlewRate::Fast);
-                pin
-            },
-        },
-        uart: {
-            let uart_tx = hal_pins.gpio20.reconfigure();
-            let uart_rx = hal_pins.gpio21.reconfigure();
-            let uart = hal::uart::UartPeripheral::new(
-                periph.UART1,
-                (uart_tx, uart_rx),
-                &mut periph.RESETS,
-            );
-            let config = hal::uart::UartConfig::new(
-                115200.Hz(),
-                hal::uart::DataBits::Eight,
-                None,
-                hal::uart::StopBits::One,
-            );
-            let mut uart = uart
-                .enable(config, clocks.system_clock.freq())
-                .expect("UART failed to configure");
-            uart.set_fifos(false);
-            // uart.enable_rx_interrupt();
-            // uart.enable_tx_interrupt();
-            uart
-        },
-        _led: { hal_pins.gpio25.reconfigure() },
-    };
-
-    info!("Setting up Core 1...");
+    let mut hw = hw::Hardware::init();
 
     let _ = writeln!(hw.uart, "Hello UART!");
 
-    start_core1(
-        periph.DMA,
-        periph.PIO0,
-        periph.RESETS,
-        &mut periph.PSM,
-        &mut periph.PPB,
-        &mut sio.fifo,
-    );
+    // Load the 8x16 font
+    vga::FONT_BUFFER.load_font(&vga::font16::FONT);
 
-    // Load the 8x16 font first (so it isn't 'unused')
-    FONT_BUFFER.load_font(&font16::FONT);
-
-    // Now load the 8x8 font
-    FONT_BUFFER.load_font(&font8::FONT);
-
-    // Set video mode to 0x01 (640x480 @ 60Hz, 80x60, 8x8 font)
-    sio.fifo.write_blocking(0xA000_0001);
-    let msg = sio.fifo.read_blocking();
-    info!("Set video mode, got {=u32:08x} from Core 1", msg);
+    // Set video mode to 0x00 (640x480 @ 60Hz, 80x30, 8x16 font)
+    hw.fifo.write_blocking(0xA000_0000);
+    let msg = hw.fifo.read_blocking();
+    defmt::info!("Set video mode, got {=u32:08x} from Core 1", msg);
 
     // Set framebuffer pointer
     let command = 0xA100_0000;
-    let ptr = VIDEO_BUFFER.get_ptr() as u32;
+    let ptr = vga::VIDEO_BUFFER.get_ptr() as u32;
     let send = command | ((ptr - 0x2000_0000) >> 2);
-    sio.fifo.write_blocking(send);
-    let msg = sio.fifo.read_blocking();
-    info!(
+    hw.fifo.write_blocking(send);
+    let msg = hw.fifo.read_blocking();
+    defmt::info!(
         "Set buffer pointer {=u32:08x}, got {=u32:08x} from Core 1",
-        send, msg
+        send,
+        msg
     );
 
     // Set font pointer
     let command = 0xA200_0000;
-    let ptr = FONT_BUFFER.get_ptr() as u32;
+    let ptr = vga::FONT_BUFFER.get_ptr() as u32;
     let send = command | ((ptr - 0x2000_0000) >> 2);
-    sio.fifo.write_blocking(send);
-    let msg = sio.fifo.read_blocking();
-    info!(
+    hw.fifo.write_blocking(send);
+    let msg = hw.fifo.read_blocking();
+    defmt::info!(
         "Set font pointer {=u32:08x}, got {=u32:08x} from Core 1",
-        send, msg
+        send,
+        msg
     );
 
-    let fg_colours = [
-        neotron_common_bios::video::TextForegroundColour::Black,
-        neotron_common_bios::video::TextForegroundColour::Blue,
-        neotron_common_bios::video::TextForegroundColour::Green,
-        neotron_common_bios::video::TextForegroundColour::Cyan,
-        neotron_common_bios::video::TextForegroundColour::Red,
-        neotron_common_bios::video::TextForegroundColour::Magenta,
-        neotron_common_bios::video::TextForegroundColour::Brown,
-        neotron_common_bios::video::TextForegroundColour::LightGray,
-        neotron_common_bios::video::TextForegroundColour::DarkGray,
-        neotron_common_bios::video::TextForegroundColour::LightBlue,
-        neotron_common_bios::video::TextForegroundColour::LightGreen,
-        neotron_common_bios::video::TextForegroundColour::LightCyan,
-        neotron_common_bios::video::TextForegroundColour::LightRed,
-        neotron_common_bios::video::TextForegroundColour::Pink,
-        neotron_common_bios::video::TextForegroundColour::Yellow,
-        neotron_common_bios::video::TextForegroundColour::White,
-    ];
-    let bg_colours = [
-        neotron_common_bios::video::TextBackgroundColour::Black,
-        neotron_common_bios::video::TextBackgroundColour::Blue,
-        neotron_common_bios::video::TextBackgroundColour::Green,
-        neotron_common_bios::video::TextBackgroundColour::Cyan,
-        neotron_common_bios::video::TextBackgroundColour::Red,
-        neotron_common_bios::video::TextBackgroundColour::Magenta,
-        neotron_common_bios::video::TextBackgroundColour::Brown,
-        neotron_common_bios::video::TextBackgroundColour::LightGray,
-    ];
+    let mut vte: vte::Parser<16> = vte::Parser::new_with_size();
 
-    let mut fg_iter = fg_colours.iter().cycle();
-    let mut bg_iter = bg_colours.iter().cycle();
-    let mut ch_iter = (0..=255).cycle();
+    let mut console = unsafe { Console::new(80, 30) };
+
+    console.clear();
+    console.cursor_enable();
 
     loop {
-        for y in 0..60 {
-            let bg = bg_iter.next().unwrap();
-            for x in 0..80 {
-                let fg = fg_iter.next().unwrap();
-                let ch = ch_iter.next().unwrap();
-                let attr = neotron_common_bios::video::Attr::new(*fg, *bg, false);
-                VIDEO_BUFFER.store_at(ch, attr.as_u8(), x, y);
-                // let's do 100 chars per second
-                delay.delay_ms(10);
-            }
+        let mut buffer = [0u8; 1];
+        if let Ok(1) = hw.uart.read_raw(&mut buffer) {
+            // defmt::info!("Got {:02x} ({})", buffer[0], buffer[0] as char);
+            vte.advance(&mut console, buffer[0]);
         }
     }
 }
 
-/// Check if the rest of the system appears to be running already.
-///
-/// If so, returns `true`, else `false`.
-///
-/// This probably means Core 0 reset but the rest of the system did not, and you
-/// should do a hard reset to get everything back into sync.
-fn stuff_running(p: &mut pac::Peripherals) -> bool {
-    // Look at scratch register 7 and see what we left ourselves. If it's zero,
-    // this was a full clean boot-up. If it's 0xDEADC0DE, this means we were
-    // running and Core 0 restarted without restarting everything else.
-    let scratch = p.WATCHDOG.scratch7().read().bits();
-    defmt::info!("WD Scratch is 0x{:08x}", scratch);
-    if scratch == 0xDEADC0DE {
-        // we need a hard reset
-        true
-    } else {
-        // set the marker so we know Core 0 has booted up
-        p.WATCHDOG
-            .scratch7()
-            .write(|w| unsafe { w.bits(0xDEADC0DE) });
-        false
-    }
+struct Console {
+    /// The width of the screen in characters
+    width_chars: u16,
+    /// The height of the screen in characters
+    height_chars: u16,
+    /// The current row position in characters
+    row: u16,
+    /// The current column position in characters
+    col: u16,
+    /// The attribute to apply to the next character we draw
+    attr: Attr,
+    /// Have we seen the ANSI 'bold' command?
+    bright: bool,
+    /// Have we seen the ANSI 'reverse' command?
+    reverse: bool,
+    /// Should we draw a cursor?
+    cursor_wanted: bool,
+    /// How many times has the cursor been turned off?
+    ///
+    /// The cursor is only enabled when at `0`.
+    cursor_depth: u8,
+    /// What character should be where the cursor currently is?
+    cursor_holder: Option<u8>,
 }
 
-/// Clear the scratch register so we don't force a full watchdog reboot on the
-/// next boot.
-fn clear_scratch() {
-    let p = unsafe { pac::Peripherals::steal() };
-    p.WATCHDOG.scratch7().write(|w| unsafe { w.bits(0) });
-}
-
-/// Do a full watchdog reboot
-fn watchdog_reboot() -> ! {
-    clear_scratch();
-    let p = unsafe { pac::Peripherals::steal() };
-    let mut watchdog = hal::Watchdog::new(p.WATCHDOG);
-    watchdog.start(fugit::Duration::<u32, 1, 1000000>::millis(10));
-    loop {
-        cortex_m::asm::wfi();
-    }
-}
-
-/// Start the video renderer on Core 1.
-///
-/// Core 1 will use the RESETS, DMA and PIO0 peripherals, so we take ownership
-/// of those objects away from the Core 0 firmware.
-fn start_core1(
-    _dma: hal::pac::DMA,
-    _pio: hal::pac::PIO0,
-    _resets: hal::pac::RESETS,
-    psm: &mut hal::pac::PSM,
-    ppb: &mut hal::pac::PPB,
-    fifo: &mut hal::sio::SioFifo,
-) {
-    static CORE1_STACK: rp2040_hal::multicore::Stack<4096> = rp2040_hal::multicore::Stack::new();
-
-    let mut multicore = hal::multicore::Multicore::new(psm, ppb, fifo);
-    let core1 = &mut multicore.cores()[1];
-    let core1_vector_table = unsafe { &CORE1_VECTOR_TABLE };
-    info!(
-        "Core 1 sp=0x{=usize:08x}, reset=0x{=usize:08x}",
-        core1_vector_table.stack_pointer, core1_vector_table.reset_function as usize
+impl Console {
+    const DEFAULT_ATTR: Attr = Attr::new(
+        TextForegroundColour::LightGray,
+        TextBackgroundColour::Black,
+        false,
     );
-    // off the top of the chip? (or blank...)
-    if core1_vector_table.stack_pointer < 0x2000_0000
-        || core1_vector_table.stack_pointer > 0x2004_2000
-    {
-        defmt::panic!(
-            "Core1 entry address 0x{:08x} is bad?!",
-            core1_vector_table.stack_pointer
-        );
+
+    /// Create a new console
+    ///
+    /// # Safety
+    ///  
+    /// `addr` must point to a buffer of at least `width * height * 2`` bytes.
+    pub unsafe fn new(width: u16, height: u16) -> Console {
+        Console {
+            width_chars: width,
+            height_chars: height,
+            col: 0,
+            row: 0,
+            attr: Self::DEFAULT_ATTR,
+            bright: false,
+            reverse: false,
+            cursor_wanted: false,
+            cursor_depth: 0,
+            cursor_holder: None,
+        }
     }
-    info!("Spawning Core 1...");
-    // start core 1 (although give them some stack - don't use their stack pointer)
-    let reset_func = core1_vector_table.reset_function;
-    core1
-        .spawn(CORE1_STACK.take().unwrap(), move || reset_func())
-        .expect("Spawning Core 1");
+
+    /// Replace the glyph at the current location with a cursor.
+    fn cursor_enable(&mut self) {
+        self.cursor_depth = self.cursor_depth.saturating_sub(1);
+        if self.cursor_depth == 0 && self.cursor_wanted && self.cursor_holder.is_none() {
+            // Remember what was where our cursor is (unless the cursor is off-screen, when we make something up)
+            if self.row < self.height_chars && self.col < self.width_chars {
+                let value = self.read();
+                self.write_at(self.row, self.col, b'_', true);
+                self.cursor_holder = Some(value);
+            } else {
+                self.cursor_holder = Some(b' ');
+            }
+        }
+    }
+
+    /// Replace the cursor at the current location with its previous contents.
+    fn cursor_disable(&mut self) {
+        if let Some(glyph) = self.cursor_holder.take() {
+            if self.row < self.height_chars && self.col < self.width_chars {
+                // cursor was on-screen, so restore it
+                self.write(glyph);
+            }
+        }
+        self.cursor_depth += 1;
+    }
+
+    /// Move the cursor relative to the current location.
+    ///
+    /// Clamps to the visible screen.
+    fn move_cursor_relative(&mut self, rows: i16, cols: i16) {
+        let new_row = self.row as i16 + rows;
+        if new_row < 0 {
+            self.row = 0;
+        } else if new_row >= self.height_chars as i16 {
+            self.row = self.height_chars - 1;
+        } else {
+            self.row = new_row as u16;
+        }
+        let new_col = self.col as i16 + cols;
+        if new_col < 0 {
+            self.col = 0;
+        } else if new_col >= self.width_chars as i16 {
+            self.col = self.width_chars - 1;
+        } else {
+            self.col = new_col as u16;
+        }
+    }
+
+    /// Move the cursor to the given location.
+    ///
+    /// Clamps to the visible screen.
+    fn move_cursor_absolute(&mut self, rows: u16, cols: u16) {
+        // move it
+        self.row = rows;
+        self.col = cols;
+        // clamp it
+        self.move_cursor_relative(0, 0);
+    }
+
+    /// Move the cursor to 0,0
+    fn home(&mut self) {
+        self.move_cursor_absolute(0, 0);
+    }
+
+    /// If we are currently positioned off-screen, scroll and fix that.
+    ///
+    /// We defer this so you can write the last char on the last line without
+    /// causing it to scroll pre-emptively.
+    fn scroll_as_required(&mut self) {
+        while self.col >= self.width_chars {
+            self.col -= self.width_chars;
+            self.row += 1;
+        }
+        while self.row >= self.height_chars {
+            self.row -= 1;
+            self.scroll_page();
+        }
+    }
+
+    /// Blank the screen
+    fn clear(&mut self) {
+        self.cursor_disable();
+        for row in 0..self.height_chars {
+            for col in 0..self.width_chars {
+                self.write_at(row, col, b' ', false);
+            }
+        }
+        self.home();
+        self.cursor_enable();
+    }
+
+    /// Put a glyph at the current position on the screen.
+    ///
+    /// Don't do this if the cursor is enabled.
+    fn write(&mut self, glyph: u8) {
+        self.write_at(self.row, self.col, glyph, false);
+    }
+
+    /// Put a glyph at a given position on the screen.
+    ///
+    /// Don't do this if the cursor is enabled.
+    fn write_at(&mut self, row: u16, col: u16, glyph: u8, is_cursor: bool) {
+        assert!(row < self.height_chars, "{} >= {}?", row, self.height_chars);
+        assert!(col < self.width_chars, "{} => {}?", col, self.width_chars);
+        if !crate::IS_PANIC.load(core::sync::atomic::Ordering::Relaxed) && !is_cursor {
+            assert!(self.cursor_holder.is_none());
+        }
+
+        let attr = if self.reverse {
+            let new_fg = self.attr.bg().make_foreground();
+            let new_bg = self.attr.fg().make_background();
+            Attr::new(new_fg, new_bg, false)
+        } else {
+            self.attr
+        };
+
+        vga::VIDEO_BUFFER.store_at(glyph, attr.as_u8(), col, row);
+    }
+
+    /// Read a glyph at the current position
+    ///
+    /// Don't do this if the cursor is enabled.
+    fn read(&mut self) -> u8 {
+        self.read_at(self.row, self.col)
+    }
+
+    /// Read a glyph at the given position
+    ///
+    /// Don't do this if the cursor is enabled.
+    fn read_at(&mut self, row: u16, col: u16) -> u8 {
+        assert!(row < self.height_chars, "{} >= {}?", row, self.height_chars);
+        assert!(col < self.width_chars, "{} => {}?", col, self.width_chars);
+        if !crate::IS_PANIC.load(core::sync::atomic::Ordering::Relaxed) {
+            assert!(self.cursor_holder.is_none());
+        }
+        let (glyph, _attr) = vga::VIDEO_BUFFER.read_at(col, row);
+        glyph
+    }
+
+    /// Move everyone on screen up one line, losing the top line.
+    ///
+    /// The bottom line will be all space characters.
+    fn scroll_page(&mut self) {
+        let row_len_words = self.width_chars / 2;
+        unsafe {
+            let addr = vga::VIDEO_BUFFER.get_ptr();
+            // Scroll rows[1..=height-1] to become rows[0..=height-2].
+            core::ptr::copy(
+                addr.add(row_len_words as usize),
+                addr,
+                (row_len_words * (self.height_chars - 1)) as usize,
+            );
+        }
+        // Blank the bottom line of the screen (rows[height-1]).
+        for col in 0..self.width_chars {
+            self.write_at(self.height_chars - 1, col, b' ', false);
+        }
+    }
+
+    /// Convert a Unicode Scalar Value to a font glyph.
+    ///
+    /// Zero-width and modifier Unicode Scalar Values (e.g. `U+0301 COMBINING,
+    /// ACCENT`) are not supported. Normalise your Unicode before calling
+    /// this function.
+    fn map_char_to_glyph(input: char) -> u8 {
+        // This fixed table only works for the default font. When we support
+        // changing font, we will need to plug-in a different table for each font.
+        match input {
+            '\u{0020}'..='\u{007E}' => input as u8,
+            // 0x80 to 0x9F are the C1 control codes with no visual
+            // representation
+            '\u{00A0}' => 255, // NBSP
+            '\u{00A1}' => 173, // ¡
+            '\u{00A2}' => 189, // ¢
+            '\u{00A3}' => 156, // £
+            '\u{00A4}' => 207, // ¤
+            '\u{00A5}' => 190, // ¥
+            '\u{00A6}' => 221, // ¦
+            '\u{00A7}' => 245, // §
+            '\u{00A8}' => 249, // ¨
+            '\u{00A9}' => 184, // ©
+            '\u{00AA}' => 166, // ª
+            '\u{00AB}' => 174, // «
+            '\u{00AC}' => 170, // ¬
+            '\u{00AD}' => 240, // - (Soft Hyphen)
+            '\u{00AE}' => 169, // ®
+            '\u{00AF}' => 238, // ¯
+            '\u{00B0}' => 248, // °
+            '\u{00B1}' => 241, // ±
+            '\u{00B2}' => 253, // ²
+            '\u{00B3}' => 252, // ³
+            '\u{00B4}' => 239, // ´
+            '\u{00B5}' => 230, // µ
+            '\u{00B6}' => 244, // ¶
+            '\u{00B7}' => 250, // ·
+            '\u{00B8}' => 247, // ¸
+            '\u{00B9}' => 251, // ¹
+            '\u{00BA}' => 167, // º
+            '\u{00BB}' => 175, // »
+            '\u{00BC}' => 172, // ¼
+            '\u{00BD}' => 171, // ½
+            '\u{00BE}' => 243, // ¾
+            '\u{00BF}' => 168, // ¿
+            '\u{00C0}' => 183, // À
+            '\u{00C1}' => 181, // Á
+            '\u{00C2}' => 182, // Â
+            '\u{00C3}' => 199, // Ã
+            '\u{00C4}' => 142, // Ä
+            '\u{00C5}' => 143, // Å
+            '\u{00C6}' => 146, // Æ
+            '\u{00C7}' => 128, // Ç
+            '\u{00C8}' => 212, // È
+            '\u{00C9}' => 144, // É
+            '\u{00CA}' => 210, // Ê
+            '\u{00CB}' => 211, // Ë
+            '\u{00CC}' => 222, // Ì
+            '\u{00CD}' => 214, // Í
+            '\u{00CE}' => 215, // Î
+            '\u{00CF}' => 216, // Ï
+            '\u{00D0}' => 209, // Ð
+            '\u{00D1}' => 165, // Ñ
+            '\u{00D2}' => 227, // Ò
+            '\u{00D3}' => 224, // Ó
+            '\u{00D4}' => 226, // Ô
+            '\u{00D5}' => 229, // Õ
+            '\u{00D6}' => 153, // Ö
+            '\u{00D7}' => 158, // ×
+            '\u{00D8}' => 157, // Ø
+            '\u{00D9}' => 235, // Ù
+            '\u{00DA}' => 233, // Ú
+            '\u{00DB}' => 234, // Û
+            '\u{00DC}' => 154, // Ü
+            '\u{00DD}' => 237, // Ý
+            '\u{00DE}' => 232, // Þ
+            '\u{00DF}' => 225, // ß
+            '\u{00E0}' => 133, // à
+            '\u{00E1}' => 160, // á
+            '\u{00E2}' => 131, // â
+            '\u{00E3}' => 198, // ã
+            '\u{00E4}' => 132, // ä
+            '\u{00E5}' => 134, // å
+            '\u{00E6}' => 145, // æ
+            '\u{00E7}' => 135, // ç
+            '\u{00E8}' => 138, // è
+            '\u{00E9}' => 130, // é
+            '\u{00EA}' => 136, // ê
+            '\u{00EB}' => 137, // ë
+            '\u{00EC}' => 141, // ì
+            '\u{00ED}' => 161, // í
+            '\u{00EE}' => 140, // î
+            '\u{00EF}' => 139, // ï
+            '\u{00F0}' => 208, // ð
+            '\u{00F1}' => 164, // ñ
+            '\u{00F2}' => 149, // ò
+            '\u{00F3}' => 162, // ó
+            '\u{00F4}' => 147, // ô
+            '\u{00F5}' => 228, // õ
+            '\u{00F6}' => 148, // ö
+            '\u{00F7}' => 246, // ÷
+            '\u{00F8}' => 155, // ø
+            '\u{00F9}' => 151, // ù
+            '\u{00FA}' => 163, // ú
+            '\u{00FB}' => 150, // û
+            '\u{00FC}' => 129, // ü
+            '\u{00FD}' => 236, // ý
+            '\u{00FE}' => 231, // þ
+            '\u{00FF}' => 152, // ÿ
+            '\u{0131}' => 213, // ı
+            '\u{0192}' => 159, // ƒ
+            '\u{2017}' => 242, // ‗
+            '\u{2022}' => 7,   // •
+            '\u{203C}' => 19,  // ‼
+            '\u{2190}' => 27,  // ←
+            '\u{2191}' => 24,  // ↑
+            '\u{2192}' => 26,  // →
+            '\u{2193}' => 25,  // ↓
+            '\u{2194}' => 29,  // ↔
+            '\u{2195}' => 18,  // ↕
+            '\u{21A8}' => 23,  // ↨
+            '\u{221F}' => 28,  // ∟
+            '\u{2302}' => 127, // ⌂
+            '\u{2500}' => 196, // ─
+            '\u{2502}' => 179, // │
+            '\u{250C}' => 218, // ┌
+            '\u{2510}' => 191, // ┐
+            '\u{2514}' => 192, // └
+            '\u{2518}' => 217, // ┘
+            '\u{251C}' => 195, // ├
+            '\u{2524}' => 180, // ┤
+            '\u{252C}' => 194, // ┬
+            '\u{2534}' => 193, // ┴
+            '\u{253C}' => 197, // ┼
+            '\u{2550}' => 205, // ═
+            '\u{2551}' => 186, // ║
+            '\u{2554}' => 201, // ╔
+            '\u{2557}' => 187, // ╗
+            '\u{255A}' => 200, // ╚
+            '\u{255D}' => 188, // ╝
+            '\u{2560}' => 204, // ╠
+            '\u{2563}' => 185, // ╣
+            '\u{2566}' => 203, // ╦
+            '\u{2569}' => 202, // ╩
+            '\u{256C}' => 206, // ╬
+            '\u{2580}' => 223, // ▀
+            '\u{2584}' => 220, // ▄
+            '\u{2588}' => 219, // █
+            '\u{2591}' => 176, // ░
+            '\u{2592}' => 177, // ▒
+            '\u{2593}' => 178, // ▓
+            '\u{25A0}' => 254, // ■
+            '\u{25AC}' => 22,  // ▬
+            '\u{25B2}' => 30,  // ▲
+            '\u{25BA}' => 16,  // ►
+            '\u{25BC}' => 31,  // ▼
+            '\u{25C4}' => 17,  // ◄
+            '\u{25CB}' => 9,   // ○
+            '\u{25D8}' => 8,   // ◘
+            '\u{25D9}' => 10,  // ◙
+            '\u{263A}' => 1,   // ☺
+            '\u{263B}' => 2,   // ☻
+            '\u{263C}' => 15,  // ☼
+            '\u{2640}' => 12,  // ♀
+            '\u{2642}' => 11,  // ♂
+            '\u{2660}' => 6,   // ♠
+            '\u{2663}' => 5,   // ♣
+            '\u{2665}' => 3,   // ♥
+            '\u{2666}' => 4,   // ♦
+            '\u{266A}' => 13,  // ♪
+            '\u{266B}' => 14,  // ♫
+            _ => b'?',
+        }
+    }
+}
+
+impl vte::Perform for Console {
+    /// Draw a character to the screen and update states.
+    fn print(&mut self, ch: char) {
+        self.scroll_as_required();
+        self.write(Self::map_char_to_glyph(ch));
+        self.col += 1;
+    }
+
+    /// Execute a C0 or C1 control function.
+    fn execute(&mut self, byte: u8) {
+        self.scroll_as_required();
+        match byte {
+            0x08 => {
+                // This is a backspace, so we go back one character (if we
+                // can). We expect the caller to provide "\u{0008} \u{0008}"
+                // to actually erase the char then move the cursor over it.
+                if self.col > 0 {
+                    self.col -= 1;
+                }
+            }
+            b'\r' => {
+                self.col = 0;
+            }
+            b'\t' => {
+                self.col = (self.col + 8) & !7;
+            }
+            b'\n' => {
+                self.col = 0;
+                self.row += 1;
+            }
+            _ => {
+                // ignore unknown C0 or C1 control code
+            }
+        }
+        // We may now be off-screen, but that's OK because we will scroll before
+        // we print the next thing.
+    }
+
+    /// A final character has arrived for a CSI sequence
+    ///
+    /// The `ignore` flag indicates that either more than two intermediates arrived
+    /// or the number of parameters exceeded the maximum supported length,
+    /// and subsequent characters were ignored.
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        // Just in case you want a single parameter, here it is
+        let mut first = *params.iter().next().and_then(|s| s.first()).unwrap_or(&1) as i32;
+        let mut second = *params.iter().nth(1).and_then(|s| s.first()).unwrap_or(&1) as i32;
+
+        match action {
+            'm' => {
+                // Select Graphic Rendition
+                for p in params.iter() {
+                    let Some(p) = p.first() else {
+                        // Can't handle sub-params, i.e. params with more than one value
+                        return;
+                    };
+                    defmt::info!("SGR {=u16}", *p);
+                    match *p {
+                        0 => {
+                            // Reset, or normal
+                            self.attr = Self::DEFAULT_ATTR;
+                            self.bright = false;
+                            self.reverse = false;
+                        }
+                        1 => {
+                            // Bold intensity
+                            self.bright = true;
+                        }
+                        7 => {
+                            // Reverse video
+                            self.reverse = true;
+                        }
+                        22 => {
+                            // Normal intensity
+                            self.bright = false;
+                        }
+                        // Foreground
+                        30 => {
+                            self.attr.set_fg(TextForegroundColour::Black);
+                        }
+                        31 => {
+                            self.attr.set_fg(TextForegroundColour::Red);
+                        }
+                        32 => {
+                            self.attr.set_fg(TextForegroundColour::Green);
+                        }
+                        33 => {
+                            self.attr.set_fg(TextForegroundColour::Brown);
+                        }
+                        34 => {
+                            self.attr.set_fg(TextForegroundColour::Blue);
+                        }
+                        35 => {
+                            self.attr.set_fg(TextForegroundColour::Magenta);
+                        }
+                        36 => {
+                            self.attr.set_fg(TextForegroundColour::Cyan);
+                        }
+                        37 | 39 => {
+                            self.attr.set_fg(TextForegroundColour::LightGray);
+                        }
+                        // Background
+                        40 => {
+                            self.attr.set_bg(TextBackgroundColour::Black);
+                        }
+                        41 => {
+                            self.attr.set_bg(TextBackgroundColour::Red);
+                        }
+                        42 => {
+                            self.attr.set_bg(TextBackgroundColour::Green);
+                        }
+                        43 => {
+                            self.attr.set_bg(TextBackgroundColour::Brown);
+                        }
+                        44 => {
+                            self.attr.set_bg(TextBackgroundColour::Blue);
+                        }
+                        45 => {
+                            self.attr.set_bg(TextBackgroundColour::Magenta);
+                        }
+                        46 => {
+                            self.attr.set_bg(TextBackgroundColour::Cyan);
+                        }
+                        47 | 49 => {
+                            self.attr.set_bg(TextBackgroundColour::LightGray);
+                        }
+                        _ => {
+                            // Ignore unknown code
+                        }
+                    }
+                }
+                // Now check if we're bright, and make it brighter. We do this
+                // last, because they might set the colour first and set the
+                // bright bit afterwards.
+                if self.bright {
+                    self.attr.set_fg(self.attr.fg().brighten())
+                }
+            }
+            'A' => {
+                // Cursor Up
+                if first == 0 {
+                    first = 1;
+                }
+                self.move_cursor_relative(-first as i16, 0);
+            }
+            'B' => {
+                // Cursor Down
+                if first == 0 {
+                    first = 1;
+                }
+                self.move_cursor_relative(first as i16, 0);
+            }
+            'C' => {
+                // Cursor Forward
+                if first == 0 {
+                    first = 1;
+                }
+                self.move_cursor_relative(0, first as i16);
+            }
+            'D' => {
+                // Cursor Back
+                if first == 0 {
+                    first = 1;
+                }
+                self.move_cursor_relative(0, -first as i16);
+            }
+            'E' => {
+                // Cursor next line
+                if first == 0 {
+                    first = 1;
+                }
+                self.move_cursor_relative(first as i16, 0);
+                self.move_cursor_absolute(self.row, 0);
+            }
+            'F' => {
+                // Cursor previous line
+                if first == 0 {
+                    first = 1;
+                }
+                self.move_cursor_relative(-first as i16, 0);
+                self.move_cursor_absolute(self.row, 0);
+            }
+            'G' => {
+                // Cursor horizontal absolute
+                if first == 0 {
+                    first = 1;
+                }
+                // We are zero-indexed, ANSI is 1-indexed
+                self.move_cursor_absolute(self.row, (first - 1) as u16);
+            }
+            'H' | 'f' => {
+                // Cursor Position (or Horizontal Vertical Position)
+                if first == 0 {
+                    first = 1;
+                }
+                if second == 0 {
+                    second = 1;
+                }
+                // We are zero-indexed, ANSI is 1-indexed
+                self.move_cursor_absolute((first - 1) as u16, (second - 1) as u16);
+            }
+            'J' => {
+                // Erase in Display
+                match first {
+                    0 => {
+                        // Erase the cursor through the end of the display
+                        for row in 0..self.height_chars {
+                            for col in 0..self.width_chars {
+                                if row > self.row || (row == self.row && col >= self.col) {
+                                    self.write_at(row, col, b' ', false);
+                                }
+                            }
+                        }
+                    }
+                    1 => {
+                        // Erase from the beginning of the display through the cursor
+                        for row in 0..self.height_chars {
+                            for col in 0..self.width_chars {
+                                if row < self.row || (row == self.row && col <= self.col) {
+                                    self.write_at(row, col, b' ', false);
+                                }
+                            }
+                        }
+                    }
+                    2 => {
+                        // Erase the complete display
+                        for row in 0..self.height_chars {
+                            for col in 0..self.width_chars {
+                                self.write_at(row, col, b' ', false);
+                            }
+                        }
+                    }
+                    _ => {
+                        // Ignore it
+                    }
+                }
+            }
+            'K' => {
+                // Erase in Line
+                match first {
+                    0 => {
+                        // Erase the cursor through the end of the line
+                        for col in self.col..self.width_chars {
+                            self.write_at(self.row, col, b' ', false);
+                        }
+                    }
+                    1 => {
+                        // Erase from the beginning of the line through the cursor
+                        for col in 0..=self.col {
+                            self.write_at(self.row, col, b' ', false);
+                        }
+                    }
+                    2 => {
+                        // Erase the complete line
+                        for col in 0..self.width_chars {
+                            self.write_at(self.row, col, b' ', false);
+                        }
+                    }
+                    _ => {
+                        // Ignore it
+                    }
+                }
+            }
+            'n' if first == 6 => {
+                // Device Status Report - todo.
+                //
+                // We should send "\u{001b}[<rows>;<cols>R" where <rows> and
+                // <cols> are integers for 1-indexed rows and columns
+                // respectively. But for that we need an input buffer to put bytes into.
+            }
+            'h' if intermediates.first().cloned() == Some(b'?') => {
+                // DEC special code for Cursor On. It'll be activated whenever
+                // we finish what we're printing.
+                self.cursor_wanted = true;
+            }
+            'l' if intermediates.first().cloned() == Some(b'?') => {
+                // DEC special code for Cursor Off.
+                self.cursor_wanted = false;
+            }
+            _ => {
+                // Unknown code - ignore it
+            }
+        }
+    }
 }
 
 // End of file
