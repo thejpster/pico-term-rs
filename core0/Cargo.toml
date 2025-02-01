@@ -1,6 +1,6 @@
 [package]
 name = "core0"
-version = "0.1.0"
+version = "0.2.0"
 authors = [
     "Jonathan 'theJPster' Pallant <github@thejpster.org.uk>",
     "The pico-term-rs Developers",
