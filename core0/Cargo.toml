@@ -15,17 +15,25 @@ repository = "https://github.com/thejpster/pico-term-rs"
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
+cotton-usb-host = { version = "0.1.0", default-features = false, features = ["defmt", "rp2040"] }
 defmt = "0.3"
 defmt-rtt = "0.4"
 embedded-hal = { version = "1.0.0" }
 fugit = "0.3.7"
+futures-util = { version = "0.3", default-features = false }
 neotron-common-bios = "0.12.0"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 pio = "0.2.1"
 pio-proc = "0.2.2"
+portable-atomic = { version = "1", features = ["critical-section"] }
 rp2040-boot2 = "0.3"
 rp2040-hal = { version = "0.11", features = ["rt", "critical-section-impl", "binary-info", "defmt", "rom-v2-intrinsics"] }
-vte = "=0.12.1"
+rtic = { version = "2.1", features = ["thumbv6-backend"] }
+rtic-common = "1"
+rtic-monotonics = { version = "2.0.2", features = ["rp2040"] }
+rtic-sync = "1.0.2"
+static_cell = "2"
+vte = { version = "0.15", default-features = false }
 
 [profile.release]
 debug = 2
