@@ -1,5 +1,5 @@
 [target.thumbv6m-none-eabi]
-runner = "probe-rs download --chip RP2040 --protocol swd --speed=20000"
+runner = "probe-rs download --chip RP2040 --protocol swd"
 
 [build]
 target = "thumbv6m-none-eabi"
