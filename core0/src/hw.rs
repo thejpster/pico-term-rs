@@ -1,5 +1,6 @@
 //! HW related code for Core 0
 
+use cotton_usb_host::host::rp2040::{UsbShared, UsbStatics};
 use fugit::RateExtU32;
 use rp2040_hal::{
     clocks,
@@ -9,7 +10,7 @@ use rp2040_hal::{
     },
     multicore, pac, pll,
     sio::SioFifo,
-    timer, uart, xosc, Clock as _, Sio, Timer, Watchdog,
+    uart, xosc, Clock as _, Sio, Watchdog,
 };
 
 /// On-board crystal frequency, in Hz.
@@ -97,22 +98,24 @@ pub struct Hardware {
     /// These pins are all controlled by PIO0, which is driven from the Core 1
     /// firmware. We just set them up on this side whilst we set up all the
     /// other pins.
-    _vga_pins: VgaPins,
+    pub _vga_pins: VgaPins,
     /// Our UART
     pub uart: uart::UartPeripheral<uart::Enabled, pac::UART1, UartPins>,
     /// Our blinky LED
-    _led: Pin<bank0::Gpio25, FunctionSioOutput, PullNone>,
+    pub _led: Pin<bank0::Gpio25, FunctionSioOutput, PullNone>,
     /// Our FIFO
     pub fifo: SioFifo,
-    /// Something for busy-waiting
-    pub timer: Timer,
+    /// USB Host Controller
+    pub usb: cotton_usb_host::host::rp2040::Rp2040HostController,
 }
 
 impl Hardware {
     /// Call this once on start-up to initialise the hardware
-    pub fn init() -> Hardware {
-        let mut periph = pac::Peripherals::take().unwrap();
-
+    pub fn init(
+        mut periph: pac::Peripherals,
+        usb_shared: &'static UsbShared,
+        usb_statics: &'static UsbStatics,
+    ) -> Hardware {
         // Check if stuff is running that shouldn't be. If so, do a full watchdog reboot.
         if stuff_running(&mut periph) {
             watchdog_reboot();
@@ -183,13 +186,26 @@ impl Hardware {
 
         defmt::info!("Clocks OK!");
 
+        defmt::info!("Starting timer...");
+        crate::add::Mono::start(periph.TIMER, &periph.RESETS);
+
         defmt::info!("Configuring pins...");
+
         let hal_pins = Pins::new(
             periph.IO_BANK0,
             periph.PADS_BANK0,
             sio.gpio_bank0,
             &mut periph.RESETS,
         );
+
+        let usb = cotton_usb_host::host::rp2040::Rp2040HostController::new(
+            &mut periph.RESETS,
+            periph.USBCTRL_REGS,
+            periph.USBCTRL_DPRAM,
+            usb_shared,
+            usb_statics,
+        );
+
         let mut hw = Hardware {
             _vga_pins: VgaPins {
                 _red_pins: RedPins {
@@ -324,7 +340,7 @@ impl Hardware {
             },
             _led: { hal_pins.gpio25.reconfigure() },
             fifo: sio.fifo,
-            timer: timer::Timer::new(periph.TIMER, &mut periph.RESETS, &clocks),
+            usb,
         };
 
         defmt::info!("Setting up Core 1...");

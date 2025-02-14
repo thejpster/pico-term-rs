@@ -28,11 +28,18 @@
 
 use core::{fmt::Write, sync::atomic::AtomicBool};
 
+use cotton_usb_host::{
+    host::rp2040::{UsbShared, UsbStatics},
+    usb_bus::{DeviceEvent, HubState, UsbBus},
+};
 use defmt_rtt as _;
+use futures_util::StreamExt;
 use neotron_common_bios::video::{Attr, TextBackgroundColour, TextForegroundColour};
 use panic_probe as _;
-
-use rp2040_hal::{self as hal, binary_info};
+use rp2040_hal::{self as hal, binary_info, pac};
+use rtic_monotonics::rp2040_timer_monotonic;
+use rtic_monotonics::Monotonic as _;
+use static_cell::ConstStaticCell;
 
 mod hw;
 mod vga;
@@ -55,59 +62,128 @@ pub static PICOTOOL_ENTRIES: [binary_info::EntryAddr; 5] = [
     binary_info::rp_program_build_attribute!(),
 ];
 
-#[hal::entry]
-fn main() -> ! {
-    defmt::info!(
-        "Firmware {} {} starting up",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
-    );
+#[rtic::app(device = rp2040_hal::pac, dispatchers = [ADC_IRQ_FIFO])]
+mod add {
+    use super::*;
 
-    let mut hw = hw::Hardware::init();
+    #[shared]
+    struct Shared {
+        shared: &'static UsbShared,
+    }
 
-    // Load the 8x16 font
-    vga::FONT_BUFFER.load_font(&vga::font16::FONT);
+    #[local]
+    struct Local {
+        usb: Option<cotton_usb_host::host::rp2040::Rp2040HostController>,
+        uart: hal::uart::UartPeripheral<hal::uart::Enabled, pac::UART1, hw::UartPins>,
+    }
 
-    // Set video mode to 0x00 (640x480 @ 60Hz, 80x30, 8x16 font)
-    hw.fifo.write_blocking(0xA000_0000);
-    let msg = hw.fifo.read_blocking();
-    defmt::info!("Set video mode, got {=u32:08x} from Core 1", msg);
+    rp2040_timer_monotonic!(Mono); // 1MHz!
 
-    // Set framebuffer pointer
-    let command = 0xA100_0000;
-    let ptr = vga::VIDEO_BUFFER.get_ptr() as u32;
-    let send = command | ((ptr - 0x2000_0000) >> 2);
-    hw.fifo.write_blocking(send);
-    let msg = hw.fifo.read_blocking();
-    defmt::info!(
-        "Set buffer pointer {=u32:08x}, got {=u32:08x} from Core 1",
-        send,
-        msg
-    );
+    #[init]
+    fn init(cx: init::Context) -> (Shared, Local) {
+        defmt::info!(
+            "Firmware {} {} starting up",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        );
 
-    // Set font pointer
-    let command = 0xA200_0000;
-    let ptr = vga::FONT_BUFFER.get_ptr() as u32;
-    let send = command | ((ptr - 0x2000_0000) >> 2);
-    hw.fifo.write_blocking(send);
-    let msg = hw.fifo.read_blocking();
-    defmt::info!(
-        "Set font pointer {=u32:08x}, got {=u32:08x} from Core 1",
-        send,
-        msg
-    );
+        static USB_SHARED: UsbShared = UsbShared::new();
 
-    let mut console = Console::new(80, 30);
-    console.inner.clear();
-    _ = write!(console, "\u{001b}[?25h");
-    _ = write!(console, "\u{001b}[2J");
-    _ = writeln!(console, "\u{001b}[1m\u{001b}[31mp\u{001b}[32mi\u{001b}[33mc\u{001b}[34mo\u{001b}[0m-term-rs. Licensed under the GPL. 115,200 baud.");
+        static USB_STATICS: ConstStaticCell<UsbStatics> = ConstStaticCell::new(UsbStatics::new());
 
-    loop {
-        let mut buffer = [0u8; 1];
-        if let Ok(1) = hw.uart.read_raw(&mut buffer) {
-            console.write(&buffer);
+        let mut hw = hw::Hardware::init(cx.device, &USB_SHARED, USB_STATICS.take());
+
+        // Load the 8x16 font
+        vga::FONT_BUFFER.load_font(&vga::font16::FONT);
+
+        // Set video mode to 0x00 (640x480 @ 60Hz, 80x30, 8x16 font)
+        hw.fifo.write_blocking(0xA000_0000);
+        let msg = hw.fifo.read_blocking();
+        defmt::info!("Set video mode, got {=u32:08x} from Core 1", msg);
+
+        // Set framebuffer pointer
+        let command = 0xA100_0000;
+        let ptr = vga::VIDEO_BUFFER.get_ptr() as u32;
+        let send = command | ((ptr - 0x2000_0000) >> 2);
+        hw.fifo.write_blocking(send);
+        let msg = hw.fifo.read_blocking();
+        defmt::info!(
+            "Set buffer pointer {=u32:08x}, got {=u32:08x} from Core 1",
+            send,
+            msg
+        );
+
+        // Set font pointer
+        let command = 0xA200_0000;
+        let ptr = vga::FONT_BUFFER.get_ptr() as u32;
+        let send = command | ((ptr - 0x2000_0000) >> 2);
+        hw.fifo.write_blocking(send);
+        let msg = hw.fifo.read_blocking();
+        defmt::info!(
+            "Set font pointer {=u32:08x}, got {=u32:08x} from Core 1",
+            send,
+            msg
+        );
+
+        usb_task::spawn().unwrap();
+
+        (
+            Shared {
+                shared: &USB_SHARED,
+            },
+            Local {
+                usb: Some(hw.usb),
+                uart: hw.uart,
+            },
+        )
+    }
+
+    #[idle(local = [uart])]
+    fn idle(cx: idle::Context) -> ! {
+        let mut console = Console::new(80, 30);
+        console.inner.clear();
+        _ = write!(console, "\u{001b}[?25h");
+        _ = write!(console, "\u{001b}[2J");
+        _ = writeln!(console, "\u{001b}[1m\u{001b}[31mp\u{001b}[32mi\u{001b}[33mc\u{001b}[34mo\u{001b}[0m-term-rs. Licensed under the GPL. 115,200 baud.");
+
+        loop {
+            let mut buffer = [0u8; 1];
+            if let Ok(1) = cx.local.uart.read_raw(&mut buffer) {
+                console.write(&buffer);
+            }
         }
+    }
+
+    #[task(local = [usb], shared = [&shared], priority = 2)]
+    async fn usb_task(cx: usb_task::Context) {
+        let hub_state = HubState::default();
+        let stack = UsbBus::new(cx.local.usb.take().unwrap());
+        let mut p = core::pin::pin!(stack.device_events(&hub_state, rtic_delay));
+
+        loop {
+            defmt::info!("wait for USB event");
+            let device_event = p.next().await;
+
+            defmt::info!("got USB event {:?}", device_event);
+
+            if let Some(DeviceEvent::EnumerationError(h, p, e)) = device_event {
+                defmt::info!("Enumeration error {} on hub {} port {}", e, h, p);
+            }
+
+            defmt::info!("{:?}", hub_state.topology());
+        }
+    }
+
+    #[task(binds = USBCTRL_IRQ, shared = [&shared], priority = 2)]
+    fn usb_interrupt(cx: usb_interrupt::Context) {
+        defmt::trace!("USBCTRL_IRQ!");
+        cx.shared.shared.on_irq();
+    }
+
+    fn rtic_delay(ms: usize) -> impl core::future::Future<Output = ()> {
+        Mono::delay(<Mono as rtic_monotonics::Monotonic>::Duration::millis(
+            ms as u64,
+        ))
     }
 }
 
@@ -139,9 +215,7 @@ impl Console {
     /// Process a byte
     pub fn write(&mut self, bytes: &[u8]) {
         self.inner.cursor_disable();
-        for b in bytes.iter() {
-            self.vte.advance(&mut self.inner, *b);
-        }
+        self.vte.advance(&mut self.inner, bytes);
         self.inner.cursor_enable();
     }
 }
