@@ -1,5 +1,5 @@
 [target.thumbv6m-none-eabi]
-runner = "probe-rs run --chip RP2040 --protocol swd --log-format=oneline --speed=20000"
+runner = "probe-rs run --chip RP2040 --protocol swd --log-format=oneline"
 linker = "flip-link"
 
 [build]

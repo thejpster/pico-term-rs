@@ -28,11 +28,19 @@
 
 use core::{fmt::Write, sync::atomic::AtomicBool};
 
+use cotton_usb_host::{
+    device::identify::IdentifyFromDescriptors,
+    host::rp2040::{UsbShared, UsbStatics},
+    usb_bus::{DeviceEvent, DeviceInfo, HubState, UnconfiguredDevice, UsbBus, UsbError},
+};
 use defmt_rtt as _;
+use futures::{Stream, StreamExt};
 use neotron_common_bios::video::{Attr, TextBackgroundColour, TextForegroundColour};
 use panic_probe as _;
-
-use rp2040_hal::{self as hal, binary_info};
+use rp2040_hal::{self as hal, binary_info, pac};
+use rtic_monotonics::rp2040_timer_monotonic;
+use rtic_monotonics::Monotonic as _;
+use static_cell::ConstStaticCell;
 
 mod hw;
 mod vga;
@@ -55,59 +63,181 @@ pub static PICOTOOL_ENTRIES: [binary_info::EntryAddr; 5] = [
     binary_info::rp_program_build_attribute!(),
 ];
 
-#[hal::entry]
-fn main() -> ! {
-    defmt::info!(
-        "Firmware {} {} starting up",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
-    );
+#[rtic::app(device = rp2040_hal::pac, dispatchers = [ADC_IRQ_FIFO])]
+mod add {
+    use super::*;
 
-    let mut hw = hw::Hardware::init();
+    #[shared]
+    struct Shared {
+        shared: &'static UsbShared,
+    }
 
-    // Load the 8x16 font
-    vga::FONT_BUFFER.load_font(&vga::font16::FONT);
+    #[local]
+    struct Local {
+        usb: Option<cotton_usb_host::host::rp2040::Rp2040HostController>,
+        uart: hal::uart::UartPeripheral<hal::uart::Enabled, pac::UART1, hw::UartPins>,
+    }
 
-    // Set video mode to 0x00 (640x480 @ 60Hz, 80x30, 8x16 font)
-    hw.fifo.write_blocking(0xA000_0000);
-    let msg = hw.fifo.read_blocking();
-    defmt::info!("Set video mode, got {=u32:08x} from Core 1", msg);
+    rp2040_timer_monotonic!(Mono); // 1MHz!
 
-    // Set framebuffer pointer
-    let command = 0xA100_0000;
-    let ptr = vga::VIDEO_BUFFER.get_ptr() as u32;
-    let send = command | ((ptr - 0x2000_0000) >> 2);
-    hw.fifo.write_blocking(send);
-    let msg = hw.fifo.read_blocking();
-    defmt::info!(
-        "Set buffer pointer {=u32:08x}, got {=u32:08x} from Core 1",
-        send,
-        msg
-    );
+    #[init]
+    fn init(cx: init::Context) -> (Shared, Local) {
+        defmt::info!(
+            "Firmware {} {} starting up",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        );
 
-    // Set font pointer
-    let command = 0xA200_0000;
-    let ptr = vga::FONT_BUFFER.get_ptr() as u32;
-    let send = command | ((ptr - 0x2000_0000) >> 2);
-    hw.fifo.write_blocking(send);
-    let msg = hw.fifo.read_blocking();
-    defmt::info!(
-        "Set font pointer {=u32:08x}, got {=u32:08x} from Core 1",
-        send,
-        msg
-    );
+        static USB_SHARED: UsbShared = UsbShared::new();
 
-    let mut console = Console::new(80, 30);
-    console.inner.clear();
-    _ = write!(console, "\u{001b}[?25h");
-    _ = write!(console, "\u{001b}[2J");
-    _ = writeln!(console, "\u{001b}[1m\u{001b}[31mp\u{001b}[32mi\u{001b}[33mc\u{001b}[34mo\u{001b}[0m-term-rs. Licensed under the GPL. 115,200 baud.");
+        static USB_STATICS: ConstStaticCell<UsbStatics> = ConstStaticCell::new(UsbStatics::new());
 
-    loop {
-        let mut buffer = [0u8; 1];
-        if let Ok(1) = hw.uart.read_raw(&mut buffer) {
-            console.write(&buffer);
+        let mut hw = hw::Hardware::init(cx.device, &USB_SHARED, USB_STATICS.take());
+
+        // Load the 8x16 font
+        vga::FONT_BUFFER.load_font(&vga::font16::FONT);
+
+        // Set video mode to 0x00 (640x480 @ 60Hz, 80x30, 8x16 font)
+        hw.fifo.write_blocking(0xA000_0000);
+        let msg = hw.fifo.read_blocking();
+        defmt::info!("Set video mode, got {=u32:08x} from Core 1", msg);
+
+        // Set framebuffer pointer
+        let command = 0xA100_0000;
+        let ptr = vga::VIDEO_BUFFER.get_ptr() as u32;
+        let send = command | ((ptr - 0x2000_0000) >> 2);
+        hw.fifo.write_blocking(send);
+        let msg = hw.fifo.read_blocking();
+        defmt::info!(
+            "Set buffer pointer {=u32:08x}, got {=u32:08x} from Core 1",
+            send,
+            msg
+        );
+
+        // Set font pointer
+        let command = 0xA200_0000;
+        let ptr = vga::FONT_BUFFER.get_ptr() as u32;
+        let send = command | ((ptr - 0x2000_0000) >> 2);
+        hw.fifo.write_blocking(send);
+        let msg = hw.fifo.read_blocking();
+        defmt::info!(
+            "Set font pointer {=u32:08x}, got {=u32:08x} from Core 1",
+            send,
+            msg
+        );
+
+        usb_task::spawn().unwrap();
+
+        (
+            Shared {
+                shared: &USB_SHARED,
+            },
+            Local {
+                usb: Some(hw.usb),
+                uart: hw.uart,
+            },
+        )
+    }
+
+    #[idle(local = [uart])]
+    fn idle(cx: idle::Context) -> ! {
+        let mut console = Console::new(80, 30);
+        console.inner.clear();
+        _ = write!(console, "\u{001b}[?25h");
+        _ = write!(console, "\u{001b}[2J");
+        _ = writeln!(console, "\u{001b}[1m\u{001b}[31mp\u{001b}[32mi\u{001b}[33mc\u{001b}[34mo\u{001b}[0m-term-rs. Licensed under the GPL. 115,200 baud.");
+
+        loop {
+            let mut buffer = [0u8; 1];
+            if let Ok(1) = cx.local.uart.read_raw(&mut buffer) {
+                console.write(&buffer);
+            }
         }
+    }
+
+    #[task(local = [usb], shared = [&shared], priority = 2)]
+    async fn usb_task(cx: usb_task::Context) {
+        let hub_state = HubState::default();
+        let stack = UsbBus::new(cx.local.usb.take().unwrap());
+        let mut p = core::pin::pin!(stack.device_events(&hub_state, rtic_delay));
+        let mut hid = None;
+
+        loop {
+            defmt::debug!("wait for USB event");
+            let device_event = p.next().await;
+
+            defmt::info!("got USB event {:?}", device_event);
+
+            match device_event {
+                Some(DeviceEvent::Connect(unconf_dev, dev_info)) => {
+                    match configure_device(&stack, unconf_dev, dev_info).await {
+                        Ok(Some(dev)) => {
+                            hid = Some(dev);
+                        }
+                        Ok(None) => {
+                            // just ignore this device
+                        }
+                        Err(e) => {
+                            defmt::error!("USB error: {}", e);
+                        }
+                    }
+                }
+                Some(cotton_usb_host::usb_bus::DeviceEvent::HubConnect(_)) => {}
+                Some(cotton_usb_host::usb_bus::DeviceEvent::Disconnect(_)) => {}
+                Some(DeviceEvent::EnumerationError(h, p, e)) => {
+                    defmt::error!("Enumeration error {} on hub {} port {}", e, h, p);
+                }
+                Some(cotton_usb_host::usb_bus::DeviceEvent::None) => {}
+                None => {}
+            }
+
+            if let Some(hid) = hid.as_mut() {
+                let mut stream = core::pin::pin!(hid.handle());
+                if let Some(hid_report) = core::future::poll_fn(|cx| {
+                    let mut async_context = futures::task::Context::from_waker(cx.waker());
+                    stream.as_mut().poll_next(&mut async_context)
+                })
+                .await
+                {
+                    defmt::info!("HID report: {}", hid_report);
+                }
+            }
+        }
+    }
+
+    #[task(binds = USBCTRL_IRQ, shared = [&shared], priority = 2)]
+    fn usb_interrupt(cx: usb_interrupt::Context) {
+        defmt::trace!("USBCTRL_IRQ!");
+        cx.shared.shared.on_irq();
+    }
+
+    fn rtic_delay(ms: usize) -> impl core::future::Future<Output = ()> {
+        Mono::delay(<Mono as rtic_monotonics::Monotonic>::Duration::millis(
+            ms as u64,
+        ))
+    }
+}
+
+async fn configure_device<HC>(
+    bus: &UsbBus<HC>,
+    unconf_dev: UnconfiguredDevice,
+    dev_info: DeviceInfo,
+) -> Result<Option<cotton_usb_host_hid::Hid<HC>>, UsbError>
+where
+    HC: cotton_usb_host::host_controller::HostController,
+{
+    let mut hid_visitor = cotton_usb_host_hid::IdentifyHid::default();
+
+    defmt::info!("Dev Info: {}", dev_info);
+    bus.get_configuration(&unconf_dev, &mut hid_visitor).await?;
+    if let Some(config_value) = hid_visitor.identify() {
+        let dev = bus.configure(unconf_dev, config_value).await?;
+        defmt::info!("Configured HID dev: {}", dev);
+        let hid_controller = cotton_usb_host_hid::Hid::new(bus, dev)?;
+        Ok(Some(hid_controller))
+    } else {
+        defmt::warn!("Not a USB keyboard?");
+        Ok(None)
     }
 }
 
@@ -139,9 +269,7 @@ impl Console {
     /// Process a byte
     pub fn write(&mut self, bytes: &[u8]) {
         self.inner.cursor_disable();
-        for b in bytes.iter() {
-            self.vte.advance(&mut self.inner, *b);
-        }
+        self.vte.advance(&mut self.inner, bytes);
         self.inner.cursor_enable();
     }
 }
@@ -582,7 +710,7 @@ impl vte::Perform for ConsoleInner {
                         // Can't handle sub-params, i.e. params with more than one value
                         return;
                     };
-                    defmt::info!("SGR {=u16}", *p);
+                    defmt::debug!("SGR {=u16}", *p);
                     match *p {
                         0 => {
                             // Reset, or normal
