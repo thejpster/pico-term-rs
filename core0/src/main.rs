@@ -29,11 +29,12 @@
 use core::{fmt::Write, sync::atomic::AtomicBool};
 
 use cotton_usb_host::{
+    device::identify::IdentifyFromDescriptors,
     host::rp2040::{UsbShared, UsbStatics},
-    usb_bus::{DeviceEvent, HubState, UsbBus},
+    usb_bus::{DeviceEvent, DeviceInfo, HubState, UnconfiguredDevice, UsbBus, UsbError},
 };
 use defmt_rtt as _;
-use futures_util::StreamExt;
+use futures::{Stream, StreamExt};
 use neotron_common_bios::video::{Attr, TextBackgroundColour, TextForegroundColour};
 use panic_probe as _;
 use rp2040_hal::{self as hal, binary_info, pac};
@@ -159,18 +160,48 @@ mod add {
         let hub_state = HubState::default();
         let stack = UsbBus::new(cx.local.usb.take().unwrap());
         let mut p = core::pin::pin!(stack.device_events(&hub_state, rtic_delay));
+        let mut hid = None;
 
         loop {
-            defmt::info!("wait for USB event");
+            defmt::debug!("wait for USB event");
             let device_event = p.next().await;
 
             defmt::info!("got USB event {:?}", device_event);
 
-            if let Some(DeviceEvent::EnumerationError(h, p, e)) = device_event {
-                defmt::info!("Enumeration error {} on hub {} port {}", e, h, p);
+            match device_event {
+                Some(DeviceEvent::Connect(unconf_dev, dev_info)) => {
+                    match configure_device(&stack, unconf_dev, dev_info).await {
+                        Ok(Some(dev)) => {
+                            hid = Some(dev);
+                        }
+                        Ok(None) => {
+                            // just ignore this device
+                        }
+                        Err(e) => {
+                            defmt::error!("USB error: {}", e);
+                        }
+                    }
+                }
+                Some(cotton_usb_host::usb_bus::DeviceEvent::HubConnect(_)) => {}
+                Some(cotton_usb_host::usb_bus::DeviceEvent::Disconnect(_)) => {}
+                Some(DeviceEvent::EnumerationError(h, p, e)) => {
+                    defmt::error!("Enumeration error {} on hub {} port {}", e, h, p);
+                }
+                Some(cotton_usb_host::usb_bus::DeviceEvent::None) => {}
+                None => {}
             }
 
-            defmt::info!("{:?}", hub_state.topology());
+            if let Some(hid) = hid.as_mut() {
+                let mut stream = core::pin::pin!(hid.handle());
+                if let Some(hid_report) = core::future::poll_fn(|cx| {
+                    let mut async_context = futures::task::Context::from_waker(cx.waker());
+                    stream.as_mut().poll_next(&mut async_context)
+                })
+                .await
+                {
+                    defmt::info!("HID report: {}", hid_report);
+                }
+            }
         }
     }
 
@@ -184,6 +215,29 @@ mod add {
         Mono::delay(<Mono as rtic_monotonics::Monotonic>::Duration::millis(
             ms as u64,
         ))
+    }
+}
+
+async fn configure_device<HC>(
+    bus: &UsbBus<HC>,
+    unconf_dev: UnconfiguredDevice,
+    dev_info: DeviceInfo,
+) -> Result<Option<cotton_usb_host_hid::Hid<HC>>, UsbError>
+where
+    HC: cotton_usb_host::host_controller::HostController,
+{
+    let mut hid_visitor = cotton_usb_host_hid::IdentifyHid::default();
+
+    defmt::info!("Dev Info: {}", dev_info);
+    bus.get_configuration(&unconf_dev, &mut hid_visitor).await?;
+    if let Some(config_value) = hid_visitor.identify() {
+        let dev = bus.configure(unconf_dev, config_value).await?;
+        defmt::info!("Configured HID dev: {}", dev);
+        let hid_controller = cotton_usb_host_hid::Hid::new(bus, dev)?;
+        Ok(Some(hid_controller))
+    } else {
+        defmt::warn!("Not a USB keyboard?");
+        Ok(None)
     }
 }
 
@@ -656,7 +710,7 @@ impl vte::Perform for ConsoleInner {
                         // Can't handle sub-params, i.e. params with more than one value
                         return;
                     };
-                    defmt::info!("SGR {=u16}", *p);
+                    defmt::debug!("SGR {=u16}", *p);
                     match *p {
                         0 => {
                             // Reset, or normal

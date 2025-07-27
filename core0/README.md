@@ -43,6 +43,8 @@ Probe to your RP2040, install [`probe-rs`], and then in this folder run:
 cargo run --release
 ```
 
+You'll need to run this when the RP2040 is in Boot ROM mode (started with the BOOT0 button pressed), otherwise Core 1 and various peripherals will be running already and we have to force a system reset on start-up, which disconnects probe-rs with an error.
+
 ## Changelog
 
 See [CHANGELOG.md](./CHANGELOG.md)
